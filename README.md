@@ -17,7 +17,7 @@ This repository contains scripts for mitigating phase bias in InSAR data. It inc
    cd InSAR_PhaseBias_Correction
 
 
-Citation
+# Citation
 If you use this repository for your research, please cite the following paper:
 
 Maghsoudi, Y., Hooper, A.J., Wright, T.J., Lazecky, M., & Ansari, H. (2022). Characterizing and correcting phase biases in short-term, multilooked interferograms. Remote Sensing of Environment, 275, 113022.
@@ -36,6 +36,6 @@ For citation in BibTeX format:
 }
 
 
-Acknowledgment
+# Acknowledgment
 This work was funded by the European Space Agency (ESA) as part of the Phase Bias Correction Project. We gratefully acknowledge their support.
 
