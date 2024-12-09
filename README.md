@@ -15,3 +15,27 @@ This repository contains scripts for mitigating phase bias in InSAR data. It inc
    ```bash
    git clone https://github.com/YourUsername/InSAR_PhaseBias_Correction.git
    cd InSAR_PhaseBias_Correction
+
+
+Citation
+If you use this repository for your research, please cite the following paper:
+
+Maghsoudi, Y., Hooper, A.J., Wright, T.J., Lazecky, M., & Ansari, H. (2022). Characterizing and correcting phase biases in short-term, multilooked interferograms. Remote Sensing of Environment, 275, 113022.
+https://doi.org/10.1016/j.rse.2022.113022
+
+For citation in BibTeX format:
+
+@article{Maghsoudi2022,
+    author = {Maghsoudi, Y., Hooper, A.J., Wright, T.J., Lazecky, M., and Ansari, H.},
+    title = {Characterizing and correcting phase biases in short-term, multilooked interferograms},
+    journal = {Remote Sensing of Environment},
+    volume = {275},
+    pages = {113022},
+    year = {2022},
+    doi = {10.1016/j.rse.2022.113022}
+}
+
+
+Acknowledgment
+This work was funded by the European Space Agency (ESA) as part of the Phase Bias Correction Project. We gratefully acknowledge their support.
+
