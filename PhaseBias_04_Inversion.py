@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -19,7 +20,7 @@ from scipy.sparse import csc_array
 #from scipy.sparse.linalg import inv
 from scipy.sparse.linalg import lsqr
 #from scipy.sparse.linalg import lsmr
-
+import sys
 #from Tikhonov_inversion import solve_inversion
 #from joblib import Parallel, delayed
 #from numpy.linalg import LinAlgError
@@ -37,7 +38,55 @@ warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
 
 ################################################################################
 
+HELP_TEXT = """
+PhaseBias_04_Inversion.py
 
+This script estimates the phase bias terms for the base interferograms using short-term closure phases as input. 
+The bias terms derived in this step serve as the foundation for correcting other short-term interferograms.
+
+### Workflow:
+1. **Masking Noisy Loop Closures:**
+   - A moving average is applied to the time-series of loop closures to account for seasonal fluctuations.
+   - A circular moving average (mean of complex values over time) is computed for each pixel.
+   - The distance of each loop closure from the moving average is calculated. If the distance exceeds a threshold (2σ), the point is masked as noisy.
+   - The circular standard deviation (σ) is computed using the von Mises distribution (circular normal distribution).
+
+2. **Refined Loop Closures:**
+   - Masked loop closures, denoted as 〖Δφ〗_(i,i+2)^r and 〖Δφ〗_(i,i+3)^r, are used as primary observations for phase bias estimation.
+
+3. **First Inversion (Without Temporal Smoothing Constraints):**
+   - Estimates the bias terms that can be corrected directly from the observed loop closures.
+
+4. **Second Inversion (With Temporal Smoothing Constraints):**
+   - Incorporates temporal smoothing constraints to estimate additional bias terms that cannot be directly derived from loop closures.
+   - The temporal smoothing minimizes differences between bias terms over time, ensuring consistency.
+
+5. **Combining Results:**
+   - Bias terms from the first inversion are combined with the results of the second inversion to include terms not estimated in the first round.
+
+### Outputs:
+- The phase bias terms for the base interferograms are stored as a NumPy array file:
+  - `X_base_ifgs_biases.npy`, saved in the `Data` directory under the `output_path` defined in `config.txt`.
+
+
+### Input Requirements:
+- Short-term closure phases (from `PhaseBias_02_Loop_Closures.py`).
+- Configuration parameters, including thresholds and temporal settings, defined in `config.txt`.
+
+### Output Files:
+- `X_base_ifgs_biases.npy`: Stores the estimated bias terms for the base interferograms.
+"""
+
+if "--help" in sys.argv:
+    print(HELP_TEXT)
+    sys.exit(0)
+
+
+
+
+
+
+###############################################################################
 # Config file path
 config_file = 'config.txt'
 
@@ -154,7 +203,7 @@ unfilt='no' # for imporing and correcting unfiltered interferograms
 #################### Read ifgs:
 print('Reading all ifgs...')
 # Define the path components
-sub_dir = "01_Data"
+sub_dir = "Data"
 filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
 
 # Construct the full file path with the refined pattern
@@ -175,7 +224,7 @@ print('Reading ifgs completed.')
 ###################### Read coh:
 print('\nReading all coherence data...')
 # Define the path components
-sub_dir = "01_Data"
+sub_dir = "Data"
 filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
 
 # Construct the full file path with the refined pattern
@@ -435,7 +484,7 @@ non_zero_column_indices = np.where(~zero_columns)[0]  # the indices of the unkno
 #print('non_zero_column_indices=', non_zero_column_indices)
 
 # Save the file
-directory_path = os.path.join(output_path, '01_Data')
+directory_path = os.path.join(output_path, 'Data')
 file_path = os.path.join(directory_path, f"indices_unknown_tobe_corrected.npy")
 np.save(file_path, non_zero_column_indices)
 
@@ -585,7 +634,7 @@ if with_temporals == 'yes':  # This is using the temporal constranints on all un
 
 
 
-directory_path = os.path.join(output_path, '01_Data')
+directory_path = os.path.join(output_path, 'Data')
 file_path = os.path.join(directory_path, f"X_base_ifgs_biases.npy")
 np.save(file_path, X)
 

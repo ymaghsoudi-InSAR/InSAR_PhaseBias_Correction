@@ -14,6 +14,50 @@ import warnings
 warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
 import pickle
 
+#######################################################################
+
+HELP_TEXT = """
+PhaseBias_01_Read_Data.py
+
+This script automates the process of downloading GeoTIFF files for wrapped interferograms and coherence images. 
+The files can be retrieved either from the COMET-LiCS web portal or from a root path specified in the configuration file.
+
+Assumptions:
+- Interferograms are organized in folders named as `yyyymmdd_yyyymmdd` (e.g., `20230101_20230107`).
+
+Files Downloaded:
+1. `yyyymmdd_yyyymmdd.geo.diff_pha.tif`: 
+   - Contains the wrapped phase image in radians.
+   - Values range from -3.14 to 3.14.
+
+2. `yyyymmdd_yyyymmdd.geo.cc.tif`: 
+   - Contains the coherence image of the interferometric pair.
+   - Values range from 0 to 255, where:
+       - 0 represents the lowest coherence.
+       - 255 represents the highest coherence.
+
+Outputs:
+1. `All_ifgs_start_end` (Pickle file, saved as `.pkl`):
+   - A dictionary containing all interferograms available between the specified start and end dates.
+2. `All_coh_start_end` (Pickle file, saved as `.pkl`):
+   - A dictionary containing all coherence data available between the specified start and end dates.
+
+Storage Information:
+- All output files are saved in the directory `Data/` under the `output_path` defined in the configuration file.
+
+Additional Output:
+- A summary report is generated that includes:
+   - The number of available interferograms for each temporal baseline.
+   - The number of missing interferograms.
+
+"""
+
+if "--help" in sys.argv:
+    print(HELP_TEXT)
+    sys.exit(0)
+
+
+
 ###################
 
 # Config file path
@@ -84,14 +128,9 @@ print('LiCSAR_data', LiCSAR_data)
 #all_ifgs = read_ifgs(frame, start, end, min_baseline, max_baseline, landmask, nlook, interval, LiCSAR_data, filtered_ifgs)
 
 
-def read_ifgs(frame, start, end, min_baseline, max_baseline, landmask, nlook , interval, LiCSAR_data, filtered_ifgs):
+def read_ifgs(start, end, min_baseline, max_baseline, landmask, nlook , interval, LiCSAR_data, filtered_ifgs):
 
 
-    track=frame[0:3]
-    if track[0]=='0':
-        track=track[1:3]
-    if track[0]=='0':
-        track=track[1:2]
     start_date = datetime.strptime(start, "%Y%m%d")
     end_date = datetime.strptime(end, "%Y%m%d")
 
@@ -109,7 +148,16 @@ def read_ifgs(frame, start, end, min_baseline, max_baseline, landmask, nlook , i
 
     # Root directory where the category directories are located
     if LiCSAR_data == 'yes':
+
+        track=frame[0:3] # extracting track number from frame id
+        if track[0]=='0':
+            track=track[1:3]
+        if track[0]=='0':
+            track=track[1:2]
+
         root_directory = '/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/' + track + '/' + frame + '/interferograms/'
+
+        
     else:
         root_directory = root_path 
         #root_directory = '/work/scratch-pw3/earyma/022D_04826_121209_subset/GEOC/' # one-off
@@ -128,7 +176,7 @@ def read_ifgs(frame, start, end, min_baseline, max_baseline, landmask, nlook , i
     last_date = {}
     n=0
 
-    if landmask != None: # in case of wrapped data the original landmask data is used
+    if landmask != None and LiCSAR_data == 'yes': # in case of wrapped data the original landmask data is used
         landmask_path = '/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/' + track + '/' + frame + '/metadata/' + frame + '.geo.landmask.tif'
         #one off     
         #landmask_path = '/work/scratch-pw3/earyma/022D_04826_121209_subset/022D_04826_121209.geo.landmask.tif'
@@ -275,15 +323,10 @@ def read_ifgs(frame, start, end, min_baseline, max_baseline, landmask, nlook , i
 ###########################################################################################################################
 ##########################################################################################################################
 
-def read_coh(frame, start, end, min_baseline, max_baseline, nlook, landmask, interval, LiCSAR_data):
+def read_coh(start, end, min_baseline, max_baseline, nlook, landmask, interval, LiCSAR_data):
     # frame = '131A_05336_121011'
     # start = '20200522'
     # end = '20201226'
-    track=frame[0:3]
-    if track[0]=='0':
-        track=track[1:3]
-    if track[0]=='0':
-        track=track[1:2]
 
     start_date = datetime.strptime(start, "%Y%m%d")
     end_date = datetime.strptime(end, "%Y%m%d")
@@ -292,9 +335,17 @@ def read_coh(frame, start, end, min_baseline, max_baseline, nlook, landmask, int
 
     # Root directory where the category directories are located
     if LiCSAR_data == 'yes':
-       root_directory = '/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/' + track + '/' + frame + '/interferograms/'
+        track=frame[0:3]
+
+        if track[0]=='0':
+            track=track[1:3]
+        if track[0]=='0':
+            track=track[1:2]
+
+        root_directory = '/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/' + track + '/' + frame + '/interferograms/'
+
     else:
-       root_directory = root_path 
+        root_directory = root_path 
        #root_directory = '/work/scratch-pw3/earyma/022D_04826_121209_subset/GEOC/' # one off
 
     req_file_name="geo.cc.tif"
@@ -314,7 +365,7 @@ def read_coh(frame, start, end, min_baseline, max_baseline, nlook, landmask, int
     last_date = {}
     n=0
 
-    if landmask != None:
+    if landmask != None and LiCSAR_data == 'yes':
         landmask_path = '/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/' + track + '/' + frame + '/metadata/' + frame + '.geo.landmask.tif'
         #one off
         #landmask_path = '/work/scratch-pw3/earyma/022D_04826_121209_subset/022D_04826_121209.geo.landmask.tif'
@@ -445,9 +496,9 @@ def read_coh(frame, start, end, min_baseline, max_baseline, nlook, landmask, int
 ##########################################################################################################################
 ##########################################################################################################################
 
-all_ifgs = read_ifgs(frame, start, end, min_baseline, max_baseline, landmask, nlook, interval, LiCSAR_data, filtered_ifgs)
+all_ifgs = read_ifgs(start, end, min_baseline, max_baseline, landmask, nlook, interval, LiCSAR_data, filtered_ifgs)
 # Define the directory path
-directory_path = os.path.join(output_path, '01_Data')
+directory_path = os.path.join(output_path, 'Data')
 
 # Create the directory if it doesn't exist
 os.makedirs(directory_path, exist_ok=True)
@@ -456,16 +507,16 @@ os.makedirs(directory_path, exist_ok=True)
 file_path = os.path.join(directory_path, f'_all_ifgs_{start}_{end}')
 
 # for writing the all_loops
-file_path = output_path + '/01_Data/' + 'All_ifgs_' + start + '_' + end
+file_path = output_path + '/Data/' + 'All_ifgs_' + start + '_' + end + '.pkl'
 with open(file_path, 'wb') as file:  # for writting a dictionary to a file
     pickle.dump(all_ifgs, file)
 ################################################################
 
-all_coh = read_coh(frame, start, end, min_baseline, max_baseline, landmask, nlook, interval, LiCSAR_data)
+all_coh = read_coh(start, end, min_baseline, max_baseline, landmask, nlook, interval, LiCSAR_data)
 
 
 ## for writting the all_coh
-file_path = output_path + '/01_Data/' + 'All_coh_' + start + '_' + end
+file_path = output_path + '/Data/' + 'All_coh_' + start + '_' + end + '.pkl'
 with open(file_path, 'wb') as file:  # for writting a dictionary to a file
     pickle.dump(all_coh, file)
 

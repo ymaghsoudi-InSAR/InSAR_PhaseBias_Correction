@@ -24,7 +24,52 @@ from bin.read_orig_ifgs_coh import read_orig_ifgs_coh
 
 from bin.ifg_cc_totif import ifg_cc_2tif
 
-#################### initial set up b#################
+###############################################################################
+
+HELP_TEXT ="""
+PhaseBias_05_Correction.py
+
+This script applies phase bias correction to desired interferograms using the estimated bias terms for the base interferograms. The corrected interferograms are saved in GeoTIFF format for further analysis.
+
+### Workflow:
+1. **Inputs:**
+   - **Original Wrapped Interferograms, and Coherence Data:** Obtained from step 1 (`PhaseBias_01_Read_Data.py`).
+   - **Estimated Bias Terms for Base Intierferograms:** Obtained from step 4 (`PhaseBias_04_Inversion.py`).
+   - **Calibration Parameters (*a_n*):** Estimated from step 3 (`PhaseBias_03_calibration_pars.py`).
+   - **max_con:** Defines the maximum number of connections to be corrected. For instance:
+     - `max_con=5` corrects interferograms up to 30-day intervals for a 6-day acquisition interval.
+     - Adjust `max_con` as needed.
+
+2. **Bias Term Estimation for Desired Interferograms:**
+   - Bias terms for desired interferograms, δ_(i,i+n+1), are estimated using the relationship:
+     δ_(i,i+n+1) = a_n * (∑_(t=i)^(i+n) δ_(t,t+1) )
+
+3. **Correction of Interferograms:**
+   - Using the estimated bias terms, the interferograms are corrected as follows:
+     φ_(i,i+n+1)^c = φ_(i,i+n+1) - δ_(i,i+n+1)
+
+   - Here, φ_(i,i+n+1) is the original interferogram, and φ_(i,i+n+1)^c is the corrected interferogram.
+
+4. **Outputs:**
+   - Corrected interferograms are saved in GeoTIFF format in the `GEOC` directory under the `output_path` specified in `config.txt`.
+
+### Output File Format:
+- **Corrected Interferograms:** Saved in GeoTIFF format, organized by temporal baseline.
+
+### Input Requirements:
+- Original wrapped interferograms from step 1.
+- Bias terms for base interferograms from step 4.
+- Configuration parameters (e.g., `output_path`, `interval`) defined in `config.txt`.
+
+### Output Directory:
+- `GEOC` directory under `output_path`: Contains the corrected interferograms in GeoTIFF format, organized by temporal baseline.
+
+"""
+if "--help" in sys.argv:
+    print(HELP_TEXT)
+    sys.exit(0)
+
+
 
 ################################################################################
 
@@ -162,7 +207,7 @@ all_ifgs_string_long = generate_ifg_pairs(start_date, end_date, interval, desire
 #################### Read ifgs:
 print('Reading all ifgs...')
 # Define the path components
-sub_dir = "01_Data"
+sub_dir = "Data"
 filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
 
 # Construct the full file path with the refined pattern
@@ -182,7 +227,7 @@ else:
 ###################### Read coh:
 print('\nReading all coherence data...')
 # Define the path components
-sub_dir = "01_Data"
+sub_dir = "Data"
 filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
 
 # Construct the full file path with the refined pattern
@@ -219,7 +264,7 @@ del ifgs, coh
 ##############################################################################################
 print('Correcting the interferograms...')
 # Define the path components
-sub_dir = "01_Data"
+sub_dir = "Data"
 filename_pattern_X = "X_base*"  # Pattern to match files starting with "X_base"
 filename_pattern_indices = "indices*"
 

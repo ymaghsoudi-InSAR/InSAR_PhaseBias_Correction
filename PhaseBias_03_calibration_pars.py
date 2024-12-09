@@ -19,7 +19,48 @@ with warnings.catch_warnings():
 
 ################################################################################
 
+HELP_TEXT ="""
+PhaseBias_03_calibration_pars.py
 
+This script estimates the calibration parameters a_n using the loop closures calculated in the previous step. 
+
+The calibration parameters a_n are estimated by calculating the ratio of the long-term loop closure for the interferogram of interest to the long-term loop closure for the base interferogram. Assuming negligible bias in long-term interferograms, a_n is calculated as follows:
+
+    a_n = |φ(i,i+l) - Σ(t=i to i+l)φ(t,t+1+n)|_2π / |φ(i,i+l) - Σ(t=i to i+l)φ(t,t+1)|_2π
+
+where:
+- φ(i,i+l) is a long-term interferogram connecting epoch i to i+l.
+- φ(t,t+1) represents the base interferogram.
+- φ(t,t+1+n) is the short interferogram to be corrected using a_n.
+
+### Input:
+1. Loop closures from the previous step (e.g., 216-6, 216-12, and 216-18 for 6-day acquisition intervals).
+2. The long-term interferogram length (e.g., 216 days) must be specified at the beginning.
+3. The number of a_n parameters to estimate, specified using `num_a`. For example:
+   - Setting `num_a=2` indicates that a1 and a2 will be estimated (used to correct 12- and 18-day interferograms).
+   - For correcting longer interferograms, `num_a` should be set accordingly.
+
+### Output:
+1. All possible a_n values are calculated.
+2. Visualizations:
+   - Example plots of a_n arrays and their corresponding histograms, illustrating spatial variations.
+   - Time-series plots showing how a_n values evolve over time.
+3. Mean a_n values over time are output for further use.
+
+### File Outputs:
+- Results are stored in the output directory defined in the `config.txt` file under `/Data/` as `Mean_an_values.pkl`.
+
+### Additional Notes:
+- Users should ensure that `num_a` aligns with the desired temporal baselines for correction.
+
+"""
+if "--help" in sys.argv:
+    print(HELP_TEXT)
+    sys.exit(0)
+
+
+
+###############################################################################
 # Config file path
 config_file = 'config.txt'
 
@@ -95,7 +136,7 @@ if track[0]=='0':
 ###################### Read coh:
 print('\nReading all coherence data...')
 # Define the path components
-sub_dir = "01_Data"
+sub_dir = "Data"
 filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
 
 # Construct the full file path with the refined pattern
@@ -143,10 +184,6 @@ print('Reading loop closures completed.')
  
 
 long_baseline = 216 # 36,72,108,144,180,216,252,288,324
-#mean_a_min = -20 # these are the range of mean a1 and mean a2 that we want to keep (if the mean is not within this range that is excluded)
-#mean_a_max = 20
-#threshold = -3*math.pi/3 # loop threhold to exclude the noisy pixels. for wrap=3.14. for unwrap data 5*math.pi/3
-#threshold1 = 3*math.pi/3 # was 2*math.pi/3 for wrapped
 coh_thresh = 25 
 
 
@@ -281,90 +318,6 @@ def plot_an(an_arrays, mean_a_long_baseline, k):
     plt.show()
 
 
-
-
-
-
-#def plot_an(an_arrays, mean_a_long_baseline):
-#    """
-#    Plots the a_n arrays with the largest coverage and their histograms, 
-#    as well as the mean values of calibration parameters a_n over time.
-#
-#    Parameters:
-#        an_arrays (list): List of a_n arrays.
-#        mean_a_long_baseline (ndarray): Array of mean calibration parameter values for a_1, a_2, ..., a_n.
-#    """
-#    import matplotlib.pyplot as plt
-#    import numpy as np
-#
-#    # Calculate the coverage (number of non-NaN values) for each array
-#    coverage = []
-#    valid_an_arrays = []  # Store only valid arrays for plotting
-#
-#    for arr in an_arrays:
-#        if arr is not None and arr.ndim == 2 and not np.all(np.isnan(arr)):  # Check for valid 2D arrays
-#            coverage.append(np.sum(~np.isnan(arr)))  # Count non-NaN values
-#            valid_an_arrays.append(arr)
-#
-#    # Sort arrays by coverage in descending order
-#    sorted_indices = np.argsort(coverage)[::-1]
-#    selected_arrays = [valid_an_arrays[idx] for idx in sorted_indices[:6]]  # Select top 6 arrays
-#
-#    # Plot the a_n arrays and their histograms
-#    if selected_arrays:
-#        num_arrays = len(selected_arrays)
-#        fig, axes = plt.subplots(1, num_arrays, figsize=(4 * num_arrays, 4), sharey=True)
-#        fig_hist, axes_hist = plt.subplots(1, num_arrays, figsize=(4 * num_arrays, 4), sharey=True)
-#
-#        if num_arrays == 1:  # Ensure axes are iterable if there's only one subplot
-#            axes = [axes]
-#            axes_hist = [axes_hist]
-#
-#        # Plot selected arrays and histograms
-#        for i, (arr, ax, ax_hist) in enumerate(zip(selected_arrays, axes, axes_hist)):
-#            im = ax.imshow(arr, cmap='RdYlBu', vmin=-0.8, vmax=0.8)
-#            ax.set_title(f'Top {i+1}')
-#            ax.axis('off')
-#
-#            # Plot histogram
-#            ax_hist.hist(arr.flatten(), bins=100, color='blue', alpha=0.7, density=True)
-#            ax_hist.set_title(f'Top {i+1} Histogram')
-#            ax_hist.set_xlim([-10, 10])  # Adjust histogram range as needed
-#
-#        # Add a single colorbar for all subplots
-#        fig.colorbar(im, ax=axes, orientation='vertical', fraction=0.02, pad=0.05)
-#        plt.tight_layout()
-#        plt.show()
-#    else:
-#        print("No valid a_n arrays available for plotting.")
-#
-#    # Plot the mean values of a_n over time
-#    x_values = np.arange(len(mean_a_long_baseline))  # Sequential indices for x-axis
-#    fig, ax = plt.subplots(figsize=(6, 4))
-#
-#    # Remove NaN values for trendline fitting
-#    valid_indices = ~np.isnan(mean_a_long_baseline)  # Mask for valid (non-NaN) entries
-#    if valid_indices.sum() > 1:  # Ensure there are at least two valid points for fitting
-#        x_valid = x_values[valid_indices]
-#        y_valid = np.array(mean_a_long_baseline)[valid_indices]
-#
-#        # Fit and plot a trendline
-#        coefficients = np.polyfit(x_valid, y_valid, 1)
-#        trendline = np.polyval(coefficients, x_valid)
-#        ax.plot(x_valid, trendline, color='red', label='Trendline')
-#
-#    # Scatter plot for all points (including NaN if any)
-#    ax.scatter(x_values, mean_a_long_baseline, color='blue', marker='o', label='Mean Values', s=9)
-#
-#    # Set labels and limits
-#    ax.set_ylim(-2, 2)  # Adjust limits as needed
-#    ax.set_xlabel('Time Step')  # Sequential index as x-axis
-#    ax.set_ylabel('Mean Values', fontsize=12)
-#    ax.legend()
-#
-#    # Adjust layout and show the plot
-#    plt.tight_layout()
-#    plt.show()
 ##
 ######### forming 360-6 
 
@@ -384,6 +337,8 @@ for i, arr in enumerate(loop_360_6_all):
   
 ###### forming 360-n (n=12,18,24 etc)
 #mean_a_long_baseline = []
+final_mean_values = []
+an_labels = []
 
 # Loop through the values of k corresponding to the number of calibration parameters
 for k in range(2, 2 + num_a):  # k=2 for a1, k=3 for a2, etc.
@@ -408,6 +363,10 @@ for k in range(2, 2 + num_a):  # k=2 for a1, k=3 for a2, etc.
     # Calculate a_n values
     mean_an_long_baseline, an_arrays = calc_an(loop_360_n, loop_360_6)
 
+    # Calculate the mean of all mean values for this k and store it
+    overall_mean = np.nanmean(mean_an_long_baseline)
+    final_mean_values.append(overall_mean)
+    an_labels.append(f"a{k-1}")
 
 
     for idx, mean_a in enumerate(mean_an_long_baseline, start=1):
@@ -420,7 +379,20 @@ for k in range(2, 2 + num_a):  # k=2 for a1, k=3 for a2, etc.
     plot_an(an_arrays, mean_an_long_baseline, k)
 
 
+# Print the final mean values across all k
+for k_idx, final_mean in enumerate(final_mean_values, start=2):
+    print(f"Final mean value for a({k_idx-1}) is {final_mean:.6f}")
 
+# Write final mean values to a text file
+output_path = os.path.join(parameters['output_path'], 'Data')  
+os.makedirs(output_path, exist_ok=True)  # Create directory if it doesn't exist
+output_file = os.path.join(output_path, 'an.txt')
+
+with open(output_file, 'w') as file:
+    for label, mean_value in zip(an_labels, final_mean_values):
+        file.write(f"{label}={mean_value:.6f}\n")
+
+print(f"Final mean values written to {output_file}.")
 
 
 

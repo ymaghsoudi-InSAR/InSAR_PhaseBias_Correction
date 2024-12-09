@@ -18,6 +18,53 @@ import warnings
 warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
 
 ################################################################################################
+
+
+HELP_TEXT = """
+PhaseBias_02_Loop_Closures.py
+
+This script calculates loop closures (Δφ) using the interferograms imported in the first step. 
+
+Definition of Loop Closures:
+Loop closures, Δφ, are calculated for the epochs between `i` and `k`, and are defined as:
+    Δφ_(i,k) = |φ_(i,k) - ∑_(t=i)^k φ_(t,t+1)|_2π 
+
+Where:
+- φ_(i,j): Represents the phase difference for a pixel in the interferogram formed between epochs `i` and `j`.
+- |.|_2π: Indicates that the result is wrapped modulo 2π (i.e., values range from -π to π).
+
+Key Information:
+- Nonzero closure phase is a by-product of spatial filtering/multilooking and is primarily associated with changes in the scattering and electrical properties of the ground surface.
+- The calculated loop closures are based on the minimum temporal-baseline interferograms defined in the configuration file (parameter: `interval`) and are referred to as base interferograms. These may represent:
+  - 12- and 6-day closures (or 24- and 12-day closures), Δφ_(i,i+2)
+  - 18- and 6-day closures (or 36- and 12-day closures), Δφ_(i,i+3)
+  The distinction depends on whether the base interferograms are 6-day or 12-day intervals.
+
+Outputs:
+- The calculated loop closures are stored as a dictionary in a file named:
+  `All_loops_start_end.pkl`
+- The output is saved in the directory `Data/` under the `output_path` defined in the configuration file.
+
+Loop Closure Report:
+At the end of the script, a loop closure report is displayed. This report includes:
+- The number of generated and missing loop closures for short-interval closures, such as 12-6 and 18-6.
+- The number of generated and missing long-interval closures, obtained using long-term interferograms, such as 204-6 and 204-12.
+
+Usage:
+1. Ensure the interferograms from the first script are available.
+2. Run the script to generate loop closures for the specified temporal baselines.
+
+Example:
+```bash
+python PhaseBias_02_Loop_Closures.py
+
+
+"""
+if "--help" in sys.argv:
+    print(HELP_TEXT)
+    sys.exit(0)
+
+
 ################################################################################################
 # Config file path
 config_file = 'config.txt'
@@ -97,7 +144,7 @@ def loop_calc(max_loop):
     ## Read ifgs:
 
     # Define the path components
-    sub_dir = "01_Data"
+    sub_dir = "Data"
     filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
 
 
@@ -121,16 +168,6 @@ def loop_calc(max_loop):
 
 
 
-
-
-
-    ## Construct the full file path assuming there's only one file with that prefix
-    #file_path = os.path.join(output_path, sub_dir, filename_prefix + "*")
-#
- #   file_path = glob.glob(file_path)[0]  # Gets the single file path directly
-#
- #   with open(file_path, 'rb') as file: # for reading the file
-  #      all_ifgs = pickle.load(file)
 
     loop = {}
     missing = {}
@@ -244,13 +281,13 @@ all_loops, missing = loop_calc(max_loop)
 
 
 # Define the directory path
-directory_path = os.path.join(output_path, '01_Data')
+directory_path = os.path.join(output_path, 'Data')
 
 # Create the directory if it doesn't exist
 os.makedirs(directory_path, exist_ok=True)
 
 # Define the file path
-file_path = os.path.join(directory_path, f'All_loops_{start}_{end}')
+file_path = os.path.join(directory_path, f'All_loops_{start}_{end}.pkl')
 
 with open(file_path, 'wb') as file:  # for writting a dictionary to a file
     pickle.dump(all_loops, file)
