@@ -1,5 +1,3 @@
-# InSAR_PhaseBias_Correction
-
 # InSAR Phase Bias Correction
 This repository contains scripts for mitigating phase bias in InSAR data. It includes tools for reading data, calculating loop closures, estimating calibration parameters, performing inversion, and correcting interferograms.
 
