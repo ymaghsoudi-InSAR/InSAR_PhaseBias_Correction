@@ -4,9 +4,9 @@ This repository contains scripts for mitigating phase bias in InSAR data. It inc
 ## Directory Structure
 - `PhaseBias_01_Read_Data.py`: Reads input wrapped ifgs and coherence data.
 - `PhaseBias_02_Loop_Closures.py`: Calculates loop closures.
-- `PhaseBias_03_calibration_pars.py`: Estimates the calibration parameters an.
-- `PhaseBias_03_Inversion.py`: Performs inversion for phase bias estimation.
-- `PhaseBias_04_Correction.py`: Corrects interferograms using estimated biases.
+- `PhaseBias_03_calibration_pars.py`: Estimates the calibration parameters *an*.
+- `PhaseBias_04_Inversion.py`: Performs inversion for phase bias estimation.
+- `PhaseBias_05_Correction.py`: Corrects interferograms using estimated biases.
 - `bin/`: Contains auxiliary functions used by the scripts.
 - `config.txt`: Configuration file for setting parameters.
 
