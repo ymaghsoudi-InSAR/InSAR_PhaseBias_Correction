@@ -16,6 +16,16 @@ This repository contains scripts for mitigating phase bias in InSAR data. It inc
    git clone https://github.com/YourUsername/InSAR_PhaseBias_Correction.git
    cd InSAR_PhaseBias_Correction
 
+## Test Dataset
+
+The test dataset used in this repository originates from one of the islands in the Azores. The full dataset can be accessed through the COMET LiCSAR frame **082D_05125_020000**, available at the following link:
+
+[https://gws-access.jasmin.ac.uk/public/nceo_geohazards/LiCSAR_products/82/082D_05125_020000/](https://gws-access.jasmin.ac.uk/public/nceo_geohazards/LiCSAR_products/82/082D_05125_020000/)
+
+Additionally, we provide a **sample dataset**, including example interferograms, which can be downloaded from Zenodo:
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14525360.svg)](https://doi.org/10.5281/zenodo.14525360)
+
 
 # Citation
 If you use this repository for your research, please cite the following paper:
