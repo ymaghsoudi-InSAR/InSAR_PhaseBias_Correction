@@ -220,35 +220,29 @@ def loop_calc(max_loop):
                             cat[l] / interval)
 
                     # recording the missing ifgs in each cat e.g. 6,12,18
-                    if np.any(np.array(all_ifgs[cat[i]])[t] == None):
+                    #if np.any(np.array(all_ifgs[cat[i]])[t] == None):
+                    if np.any(np.array(all_ifgs[cat[i]], dtype=object)[t] == None):    
                         missing[cat[i]].append(
                             t
                         )  # to record the missing ifgs index for each cateogory e.g. 18
 
-                    for e in range(
-                            t, end_index, int(cat[l] / interval)
-                    ):  # to record the missing ifgs index for the period of each loop
-                        elem = np.array(all_ifgs[cat[l]])[e]
+
+                    for e in range(t, end_index, int(cat[l]/interval)): # to record the missing ifgs index for the period of each loop
+                        elem = all_ifgs[cat[l]][e]
+
                         if elem is None:
                             missing[cat[l]].append(e)
 
-                    if np.any(np.array(all_ifgs[cat[i]])[t] == None) or np.any(
-                        [
-                            elem is None for elem in np.array(all_ifgs[cat[l]])
-                            [t:end_index:int(cat[l] / interval)]
-                        ]):
+
+
+                    if all_ifgs[cat[i]][t] is None or any(all_ifgs[cat[l]][elem] is None for elem in range(t, end_index, int(cat[l] / interval))):
+
                         loop[cat[i]][cat[l]].append(None)
-                        missing_counts[cat[i]][
-                            cat[l]] += 1  # Increment missing loop counter
+                        missing_counts[cat[i]][cat[l]] += 1  # Increment missing loop counter
 
                     else:
-                        closure = np.angle(
-                            np.exp(1j *
-                                   (np.array(all_ifgs[cat[i]])[t] - (np.sum(
-                                       np.array(all_ifgs[cat[l]])
-                                       [t:end_index:int(cat[l] / interval)],
-                                       0,
-                                   )))))
+                        closure = np.angle( np.exp( 1j * ( np.array(all_ifgs[cat[i]][t], dtype=np.float32)- np.sum( np.array(all_ifgs[cat[l]][t:end_index:int(cat[l] / interval)], dtype=np.float32), axis=0))))
+
 
                         if cat[i] in loop:
                             loop[cat[i]][cat[l]].append(closure)

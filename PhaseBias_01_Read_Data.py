@@ -328,15 +328,10 @@ def read_ifgs(
     for category in category_arrays:
         cat.append(category)
 
-    for i in range(interval, max(cat) + 1, interval):
+    for i in range(interval, max(cat)+1, interval):
         if i in cat:
-            # print('the ith category is ', i)
-            while len(category_arrays[i]) < (max_ifg_number + 1 -
-                                             i / interval):
-                category_arrays[i] = np.insert(category_arrays[i],
-                                               0,
-                                               None,
-                                               axis=0)
+            while len(category_arrays[i]) < (max_ifg_number + 1 - i/interval):
+                category_arrays[i].insert( 0, None)
 
     print("\nFinished reading all interferograms.")
 
@@ -514,14 +509,11 @@ def read_coh(start, end, min_baseline, max_baseline, nlook, landmask, interval,
     for category in category_arrays:
         cat.append(category)
 
-    for i in range(interval, max(cat) + 1, interval):
+    for i in range(interval, max(cat)+1, interval):
         if i in cat:
-            while len(category_arrays[i]) < (max_ifg_number + 1 -
-                                             i / interval):
-                category_arrays[i] = np.insert(category_arrays[i],
-                                               0,
-                                               None,
-                                               axis=0)
+            while len(category_arrays[i]) < (max_ifg_number + 1 - i/interval):
+                category_arrays[i].insert(0, None)
+
     print("\nFinished reading all coherence data.")
 
     return category_arrays
@@ -548,7 +540,14 @@ directory_path = os.path.join(output_path, "Data")
 os.makedirs(directory_path, exist_ok=True)
 
 # Define the file path
-file_path = os.path.join(directory_path, f"_all_ifgs_{start}_{end}")
+#file_path = os.path.join(directory_path, f"_all_ifgs_{start}_{end}")
+
+# Remove all files inside the directory
+if os.path.exists(directory_path):
+    files = glob.glob(os.path.join(directory_path, "*"))
+    for file in files:
+            os.remove(file)
+
 
 # for writing the all_loops
 file_path = output_path + "/Data/" + "All_ifgs_" + start + "_" + end + ".pkl"

@@ -216,6 +216,12 @@ def calc_an(loop_360_n, loop_360_6):
             )
             ratios.append(ratio_i)
 
+# Check if `ratios` is empty before proceeding
+    if not ratios:
+        print("Warning: No valid a_n values could be calculated. Returning NaN values.")
+        return np.array([np.nan]), []
+
+
     # Convert the list of ratios to a numpy array
     an = np.array(ratios, dtype=object)
     mean_an_long_baseline = []
@@ -373,6 +379,11 @@ for k in range(2, 2 + num_a):  # k=2 for a1, k=3 for a2, etc.
 
     # Calculate a_n values
     mean_an_long_baseline, an_arrays = calc_an(loop_360_n, loop_360_6)
+
+    # If all values in mean_an_long_baseline are nan (empty ratios), stop execution
+    if np.isnan(mean_an_long_baseline).all():
+        print("No valid a_n values could be calculated. Stopping execution.")
+        sys.exit(1)  # Exit the script with an error code (1 means failure)
 
     # Calculate the mean of all mean values for this k and store it
     overall_mean = np.nanmean(mean_an_long_baseline)
