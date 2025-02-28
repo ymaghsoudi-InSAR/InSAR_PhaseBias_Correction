@@ -8,7 +8,7 @@ frame=082D_05125_020000
 
 # Provide the start and end dates of the time-series that you want to calculate the phase bias correction
 start=20170801
-end=20210501
+end=20210101
 
 #Provide the data acquisition interval: 6-day or 12-day
 interval=6

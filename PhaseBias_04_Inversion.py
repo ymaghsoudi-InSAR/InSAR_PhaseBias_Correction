@@ -292,11 +292,15 @@ all_ifgs, _, existing_ifgs_index = read_orig_ifgs_coh(
 
 ######### forming 12-6 and 18-6 loop closures from the imported data
 #################################################################
-loop_12 = np.array(all_loops[2 * interval][interval])
-coh_12 = np.array(all_coh[2 * interval][:])
+loop_12 = np.array(all_loops[2 * interval][interval], dtype=object)
+#loop_12 = np.array(all_loops[2 * interval][interval])
+#coh_12 = np.array(all_coh[2 * interval][:])
+coh_12 = np.array(all_coh[2 * interval][:], dtype=object)
 
-loop_18 = np.array(all_loops[3 * interval][interval])
-coh_18 = np.array(all_coh[3 * interval][:])
+#loop_18 = np.array(all_loops[3 * interval][interval])
+#coh_18 = np.array(all_coh[3 * interval][:])
+loop_18 = np.array(all_loops[3 * interval][interval], dtype=object)
+coh_18 = np.array(all_coh[3 * interval][:], dtype=object)
 
 ############## finding dynamic pixel-based thresholds to remove the noisy loops
 loop_12_orig = []
@@ -355,11 +359,13 @@ def moving_average(arr, window_size):
 
     # Mirror the data at the beginning
     for i in range(window_size // 2):
-        mirrored_arr[i] = arr[window_size // 2 - i]
+#        mirrored_arr[i] = arr[window_size // 2 - i]
+        mirrored_arr[i] = arr[min(half_window - i, arr.shape[0] - 1)] 
 
     # Mirror the data at the end
     for i in range(window_size // 2):
-        mirrored_arr[-(i + 1)] = arr[-(i + 1) - window_size // 2]
+#        mirrored_arr[-(i + 1)] = arr[-(i + 1) - window_size // 2]
+        mirrored_arr[-(i + 1)] = arr[max(-1 - (half_window - i), 0)]
     ####
 
     # Calculate temporal averages within each window
@@ -383,6 +389,7 @@ print(
 )
 
 window_size = 30
+
 moving_avg = moving_average(loop_12_orig, window_size)
 distances = np.abs(np.angle(np.exp(1j * (loop_12_orig - moving_avg))))
 mask = distances > 4 * thresh_loop12  # it is 4*sigma
@@ -394,7 +401,7 @@ loop_12 = loop_12_orig.tolist()
 
 for idx in none_indices12:
     loop_12.insert(idx, None)
-loop_12 = np.array(loop_12)
+loop_12 = np.array(loop_12, dtype=object)
 
 # for loop 18
 # Calculate distance between each epoch and the moving average for each pixel
@@ -416,7 +423,7 @@ loop_18 = loop_18_orig.tolist()
 
 for idx in none_indices18:
     loop_18.insert(idx, None)
-loop_18 = np.array(loop_18)
+loop_18 = np.array(loop_18, dtype=object)
 
 print("Masking of noisy loop closures is completed.")
 
@@ -472,7 +479,7 @@ for i in range(len18):
     row = np.zeros(n_unk, dtype=np.float32)
 
 A = np.array(A)
-b = np.array(b)
+b = np.array(b, dtype=object)
 
 
 ####################### removing the rows from b and A where b is None
