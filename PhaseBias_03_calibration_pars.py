@@ -309,13 +309,21 @@ def plot_an(an_arrays, mean_a_long_baseline, k):
     x_values = np.arange(len(mean_a_long_baseline))  # Sequential indices for x-axis
     fig, ax = plt.subplots(figsize=(6, 4))
 
+
+    # Filter out NaN values to avoid gaps in the plot
+    valid_indices = ~np.isnan(mean_a_long_baseline)  # Mask for valid (non-NaN) entries
+    x_valid = x_values[valid_indices]  # Only use valid time steps
+    y_valid = np.array(mean_a_long_baseline)[valid_indices]  # Only use valid a_n values
+
+
     # Remove NaN values for trendline fitting
     valid_indices = ~np.isnan(mean_a_long_baseline)  # Mask for valid (non-NaN) entries
     if (
         valid_indices.sum() > 1
     ):  # Ensure there are at least two valid points for fitting
-        x_valid = x_values[valid_indices]
+#        x_valid = x_values[valid_indices]
         y_valid = np.array(mean_a_long_baseline)[valid_indices]
+        x_valid = np.arange(len(y_valid))
 
         # Fit and plot a trendline
         coefficients = np.polyfit(x_valid, y_valid, 1)
@@ -324,8 +332,11 @@ def plot_an(an_arrays, mean_a_long_baseline, k):
 
     # Scatter plot for all points (including NaN if any)
     ax.scatter(
-        x_values,
-        mean_a_long_baseline,
+        #x_values,
+        #mean_a_long_baseline,
+        x_valid,  # Only use valid time steps
+        y_valid,  # Only use valid a_n values
+
         color="blue",
         marker="o",
         label="Mean Values",
@@ -333,7 +344,7 @@ def plot_an(an_arrays, mean_a_long_baseline, k):
     )
 
     # Set labels and limits
-    ax.set_ylim(-2, 2)  # Adjust limits as needed
+    ax.set_ylim(-3, 3)  # Adjust limits as needed
     ax.set_xlabel("Time Step")  # Sequential index as x-axis
     ax.set_ylabel("Mean Values", fontsize=12)
     ax.legend()
