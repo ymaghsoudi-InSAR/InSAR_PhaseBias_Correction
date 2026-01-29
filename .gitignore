@@ -1,2 +1,5 @@
 *.swp
-bin/*.tif
+bin/
+*.tif
+*.pyc
+__pycache__/
