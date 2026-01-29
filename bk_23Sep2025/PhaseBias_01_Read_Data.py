@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 import numpy as np
 from osgeo import gdal
 from bin.multilook_w import multilook_w
-from bin.multilook import multilook
 import configparser
 import sys
 import warnings
@@ -153,6 +152,7 @@ def read_ifgs(
 
     start_date = datetime.strptime(start, "%Y%m%d")
     end_date = datetime.strptime(end, "%Y%m%d")
+
     # Check if the file ends with "geo.diff_pha.tif"
     # if filename.endswith("geo.diff_unfiltered_pha.tif"): # if unfiltered data are used
     if filtered_ifgs == "yes":  # yes for the filtered ifgs, no for the unfiltered ifgs
@@ -171,8 +171,9 @@ def read_ifgs(
 
         root_directory = f"/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/{track}/{frame}/interferograms/"
     else:
-        root_directory = os.path.join(root_path, "interferograms")  # Use os.path.join for consistent path construction
-        #root_directory = os.path.join(root_path, "")
+        root_directory = os.path.join(
+            root_path, "interferograms"
+        )  # Use os.path.join for consistent path construction
 
     ##### Count total files matching the criteria for accurate progress calculation
     print(f"Reading data from the path: {root_directory}")
@@ -269,30 +270,20 @@ def read_ifgs(
 
                         # Open the TIFF file
                         tiff_dataset = gdal.Open(file_path)
+                        # Read the image data as a NumPy array
+                        tiff_image = tiff_dataset.ReadAsArray()
 
-                        if tiff_dataset is None:
-                            print(f"⚠️ Could not open {file_path}. Appending None.")
-                            array_data = None
-                        else:
-                            try:
-                                array_data = tiff_dataset.ReadAsArray().astype(np.float32)
-                            except Exception as e:
-                                print(f"⚠️ Error reading {file_path}: {e}. Appending None instead.")
-                                array_data = None
-                            finally:
-                                del tiff_dataset
+                        # Convert the image to a numpy array
+                        array_data = np.array(tiff_image)
+                        array_data[array_data == 0] = (
+                            np.nan
+                        )  ## converting the zerso values in wrapped phases into nan. This is helpful when calculating loop closures
 
-                        #if array_data is not None:
-                        array_data[array_data == 0] = np.nan  ## converting the zerso values in wrapped phases into nan. This is helpful when calculating loop closures
-
-                        #array_data[np.abs(array_data) < 1e-8] = np.nan # as after filter i observed low vlaues outside the frame. I also wanted to nulify them. so used this insteadof above
-
-
-                        if landmask != None: #and array_data is not None:
+                        if landmask != None:
                             array_data[array_landmask != 1] = np.nan
 
                         if (
-                                nlook != None and nlook != 1 #and array_data is not None
+                                nlook != None and nlook != 1
                         ):  # incase of unwrap data because they are already multilooked to 10 we don't multilook them here
                             array_data = multilook_w(array_data, nlook)
 
@@ -351,11 +342,12 @@ def read_ifgs(
 ##########################################################################################################################
 
 
-def read_coh(start, end, min_baseline, max_baseline, landmask, nlook, interval,
+def read_coh(start, end, min_baseline, max_baseline, nlook, landmask, interval,
              LiCSAR_data):
 
     start_date = datetime.strptime(start, "%Y%m%d")
     end_date = datetime.strptime(end, "%Y%m%d")
+
     ############ reading
 
     if LiCSAR_data == "yes":
@@ -460,20 +452,13 @@ def read_coh(start, end, min_baseline, max_baseline, landmask, nlook, interval,
                         # Open the TIFF file
                         tiff_dataset = gdal.Open(file_path)
 
-                        if tiff_dataset is None:
-                            print(f"⚠️ Could not open {file_path}. Appending None.")
-                            array_data = None
-                        else:
-                            try:
-                                array_data = tiff_dataset.ReadAsArray().astype(np.float32)
-                            except Exception as e:
-                                print(f"⚠️ Error reading {file_path}: {e}. Appending None instead.")
-                                array_data = None
-                            finally:
-                                del tiff_dataset
-                        #array_data = tiff_dataset.ReadAsArray().astype(np.float32)
-                        
+                        # Read the image data as a NumPy array
+                        tiff_image = tiff_dataset.ReadAsArray()
 
+                        # Convert the image to a numpy array
+                        array_data = np.array(tiff_image)
+                        # Convert array_data to a float type that can accommodate np.nan
+                        array_data = array_data.astype(np.float32)
 
                         if landmask != 0:
                             array_data[array_landmask != 1] = np.nan
@@ -569,6 +554,20 @@ file_path = output_path + "/Data/" + "All_ifgs_" + start + "_" + end + ".pkl"
 with open(file_path, "wb") as file:  # for writting a dictionary to a file
     pickle.dump(all_ifgs, file)
 
+# Free memory before starting coherence
+import gc
+del all_ifgs
+gc.collect()
+
+################################################################
+
+all_coh = read_coh(start, end, min_baseline, max_baseline, landmask, nlook,
+                   interval, LiCSAR_data)
+
+## for writting the all_coh
+file_path = output_path + "/Data/" + "All_coh_" + start + "_" + end + ".pkl"
+with open(file_path, "wb") as file:  # for writting a dictionary to a file
+    pickle.dump(all_coh, file)
 
 ################################################
 
@@ -582,20 +581,3 @@ for category in sorted(all_ifgs):
     print(
         f"{category}-days: Number of IFGs: {num_ifgs}   Number of missing IFGs: {num_missing_ifgs}"
     )
-
-################################################################
-
-import gc
-del all_ifgs
-gc.collect()
-
-
-
-all_coh = read_coh(start, end, min_baseline, max_baseline, landmask, nlook,
-                           interval, LiCSAR_data)
-
-## for writting the all_coh
-file_path = output_path + "/Data/" + "All_coh_" + start + "_" + end + ".pkl"
-with open(file_path, "wb") as file:  # for writting a dictionary to a file
-        pickle.dump(all_coh, file)
-

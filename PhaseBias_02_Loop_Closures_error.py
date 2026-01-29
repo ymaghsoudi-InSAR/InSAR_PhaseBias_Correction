@@ -8,6 +8,7 @@ import os
 import sys
 import warnings
 warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
+import gc
 
 ################################################################################################
 
@@ -148,6 +149,21 @@ def loop_calc(max_loop):
             f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
         )
 
+    ############# testing
+    print("\n=== Sanity check on all_ifgs ===")
+    for cat_key, ifg_list in all_ifgs.items():
+        n_total = len(ifg_list)
+        n_none = sum(1 for x in ifg_list if x is None)
+        n_valid = n_total - n_none
+    
+        # get shapes of non-None arrays
+        shapes = {x.shape for x in ifg_list if isinstance(x, np.ndarray)}
+   
+        print(f"Category {cat_key}: total={n_total}, valid={n_valid}, None={n_none}, shapes={shapes}")
+    print("================================\n")
+    ################ testing done
+
+
     loop = {}
     missing = {}
 
@@ -228,26 +244,22 @@ def loop_calc(max_loop):
 
 
 
-                    # --- Check for overshoot(not enough data at the tail). this allows the calculate the missing in the next for loop
+                    # --- Boundary check: skip incomplete loops at the end of the time series ---
+                    # If the calculated end_index exceeds the number of available short-interval interferograms,
+                    # it means there aren’t enough consecutive IFGs to form a valid loop closure (e.g., near the end of the stack).
+                    # In this case, we record a missing loop (append None) and continue without processing it further.
+
                     if end_index > len(all_ifgs[cat[l]]):
-                    # Not enough short IFGs to form a valid closure → skip this loop
+                        # Not enough short IFGs to form a valid closure → skip this loop
                         loop[cat[i]][cat[l]].append(None)
                         missing_counts[cat[i]][cat[l]] += 1
                         continue
 
-
-
                     for e in range(t, end_index, int(cat[l]/interval)): # to record the missing ifgs index for the period of each loop
-                        #print(f"  Long baseline (cat[i]): {cat[i]}")
-                        #print(f"  Short baseline (cat[l]): {cat[l]}")
-                        #print(f"  Index t: {t}, e: {e}, end_index: {end_index}")
-                        #print(f"  len(all_ifgs[cat[l]]): {len(all_ifgs[cat[l]])}")
-
                         elem = all_ifgs[cat[l]][e]
 
                         if elem is None:
                             missing[cat[l]].append(e)
-
 
 
                     if all_ifgs[cat[i]][t] is None or any(all_ifgs[cat[l]][elem] is None for elem in range(t, end_index, int(cat[l] / interval))):
@@ -256,7 +268,8 @@ def loop_calc(max_loop):
                         missing_counts[cat[i]][cat[l]] += 1  # Increment missing loop counter
 
                     else:
-                        closure = np.angle( np.exp( 1j * ( np.array(all_ifgs[cat[i]][t], dtype=np.float32)- np.sum( np.array(all_ifgs[cat[l]][t:end_index:int(cat[l] / interval)], dtype=np.float32), axis=0))))
+                        #closure = np.angle( np.exp( 1j * ( np.array(all_ifgs[cat[i]][t], dtype=np.float32)- np.sum( np.array(all_ifgs[cat[l]][t:end_index:int(cat[l] / interval)], dtype=np.float32), axis=0))))
+                        closure = np.angle( np.exp( 1j * ( all_ifgs[cat[i]][t] - np.sum( all_ifgs[cat[l]][t:end_index:int(cat[l] / interval)], axis=0)))) #removed the np.array from above for more efficiecy
 
                         if cat[i] in loop:
                             loop[cat[i]][cat[l]].append(closure)
@@ -264,7 +277,13 @@ def loop_calc(max_loop):
 
                         else:
                             loop[cat[i]][cat[l]] = [closure]
+
+
+
     print("\n Finished calculating the loop closures.")
+    
+    del closure
+    gc.collect()
 
     # Generate report
     print("\n=== Loop Closure Report ===")
@@ -294,9 +313,12 @@ def loop_calc(max_loop):
                         print(
                             f"Loop Closure {category} - {l}: Generated = {generated}"
                         )
+    
+    del all_ifgs
+    gc.collect()
+
 
     return loop, missing
-
 
 ################################################################################################
 

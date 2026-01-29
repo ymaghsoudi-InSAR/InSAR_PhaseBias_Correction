@@ -203,7 +203,7 @@ if track[0] == "0":
 if track[0] == "0":
     track = track[1:2]
 
-with_temporals = "yes" # it should be yes, if you want to incorporate the temporal constraints
+with_temporals = "yes"
 apply_to_all = "no"  # in case of with_temporal='yes', we can decide if you want to use the temporal to all ifgs (i.e. apply_to_all='yes'), or just to those that can not be corrected (i.e. apply_to_all='no')
 w = 0.1  # the weigth of the temporal smoothing constraints
 #######
@@ -211,53 +211,56 @@ coh_thresh = 11  # threhsold on the coherence values. In this version it is off
 min_num_eq = 10  # I used 10 in all my experiments. min number of equations in the least square inversion.
 
 ############################### Reading input data #############################################
-#################### Read ifgs:
-print("Reading all ifgs...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
 
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
+##################### Read ifgs:
+#print("Reading all ifgs...")
+## Define the path components
+#sub_dir = "Data"
+#filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
+#
+## Construct the full file path with the refined pattern
+#file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
+## Use glob to find the file and ensure it exists
+#file_list = glob.glob(file_path_pattern)
+#if file_list:
+#    file_path = file_list[0]  # Get the single file path directly
+#
+#    # Load the data from the file
+#    with open(file_path, "rb") as file:
+#        all_ifgs = pickle.load(file)
+#else:
+#    raise FileNotFoundError(
+#        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
+#    )
+#print("Reading ifgs completed.")
 
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        all_ifgs = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
-print("Reading ifgs completed.")
 
-###################### Read coh:
-print("\nReading all coherence data...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
-
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        all_coh = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
-print("Reading coherence data completed.")
+####################### Read coh:
+#print("\nReading all coherence data...")
+## Define the path components
+#sub_dir = "Data"
+#filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
+#
+## Construct the full file path with the refined pattern
+#file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
+## Use glob to find the file and ensure it exists
+#file_list = glob.glob(file_path_pattern)
+#if file_list:
+#    file_path = file_list[0]  # Get the single file path directly
+#
+#    # Load the data from the file
+#    with open(file_path, "rb") as file:
+#        all_coh = pickle.load(file)
+#else:
+#    raise FileNotFoundError(
+#        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
+#    )
+#print("Reading coherence data completed.")
 
 ##################### Read Loops
 
 print("\nReading all loop closures...")
+sub_dir = "Data"
 filename_pattern = "All_loops_*"  # Pattern to match files starting with "All_ifgs"
 
 # Construct the full file path with the refined pattern
@@ -285,22 +288,18 @@ for cat in all_loops:
 print(
     "Extracting the required interferograms(up to 3 epochs), and the corresponding loop closures for inversion..."
 )
-desired_categories = [interval, 2 * interval, 3 * interval]
-all_ifgs, _, existing_ifgs_index = read_orig_ifgs_coh(
-    all_ifgs, all_coh, desired_categories
-)
+#desired_categories = [interval, 2 * interval, 3 * interval]
+#all_ifgs, _, existing_ifgs_index = read_orig_ifgs_coh(
+#    all_ifgs, all_coh, desired_categories
+#)
 
 ######### forming 12-6 and 18-6 loop closures from the imported data
 #################################################################
 loop_12 = np.array(all_loops[2 * interval][interval], dtype=object)
-#loop_12 = np.array(all_loops[2 * interval][interval])
-#coh_12 = np.array(all_coh[2 * interval][:])
-coh_12 = np.array(all_coh[2 * interval][:], dtype=object)
+#coh_12 = np.array(all_coh[2 * interval][:], dtype=object)
 
-#loop_18 = np.array(all_loops[3 * interval][interval])
-#coh_18 = np.array(all_coh[3 * interval][:])
 loop_18 = np.array(all_loops[3 * interval][interval], dtype=object)
-coh_18 = np.array(all_coh[3 * interval][:], dtype=object)
+#coh_18 = np.array(all_coh[3 * interval][:], dtype=object)
 
 ############## finding dynamic pixel-based thresholds to remove the noisy loops
 loop_12_orig = []
@@ -392,7 +391,7 @@ window_size = 30
 
 moving_avg = moving_average(loop_12_orig, window_size)
 distances = np.abs(np.angle(np.exp(1j * (loop_12_orig - moving_avg))))
-mask = distances > 2 * thresh_loop12  # it is 4*sigma
+mask = distances > 4 * thresh_loop12  # it is 4*sigma
 
 # Replace values with NaN where mask is True
 loop_12_bk = loop_12_orig
@@ -414,7 +413,7 @@ print(
 
 moving_avg = moving_average(loop_18_orig, window_size)
 distances = np.abs(np.angle(np.exp(1j * (loop_18_orig - moving_avg))))
-mask = distances > 2 * thresh_loop18  # it is 4*sigma
+mask = distances > 4 * thresh_loop18  # it is 4*sigma
 
 # Replace values with NaN where mask is True
 loop_18_bk = loop_18_orig
@@ -579,15 +578,6 @@ if apply_to_all == "no":  # this is without using any temporal constraints
                     :5
                 ]  # Using sparse matrix representation scipy.sparse.linalg
                 X1[:, row, col] = x
-
-
-#    if with_temporals == "no": # this solution will be the final answer to be saved as X
-#        # Fill X with values from X1 according to non_zero_column_indices
-#        for i, idx in enumerate(non_zero_column_indices):
-#            X[idx, :, :] = X1[i, :, :]
-
-
-
 
 print("\nFirst inversion (without temporal smoothing constraints) completed.")
 

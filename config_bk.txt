@@ -1,22 +1,23 @@
 [DEFAULT]
 # That path to interferograms directory. In case of LiCSAR data set LiCSAR_public='yes', and provide the frame id
-root_path = /gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products.public/44/044A_04728_131314
+root_path = /gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/82/082D_05125_020000/
 
-output_path = /work/scratch-pw4/earyma/ESA_project/044A_04728_131314
+#output_path = /work/scratch-pw2/earyma
+output_path = /gws/nopw/j04/nceo_geohazards_vol2/LiCS/temp/insar_proc/earyma/test1
 
-LiCSAR_data=no
-frame=044A_04728_131314
+LiCSAR_data=yes
+frame=082D_05125_020000
 
 # Provide the start and end dates of the time-series that you want to calculate the phase bias correction
-start=20170513
-end=20210504
+start=20170522
+end=2021501
 
 #Provide the data acquisition interval: 6-day or 12-day
 interval=6
 
 
 # If you want to apply further multilooking to interferograms (expand the explanation)
-nlook=10
+nlook=1
 
  
 # The calibration parameters 'an' can be estimated from the data by specifying the number of parameters to be determined. For instance, setting num_a=2 indicates that 

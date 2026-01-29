@@ -227,22 +227,7 @@ def loop_calc(max_loop):
                         )  # to record the missing ifgs index for each cateogory e.g. 18
 
 
-
-                    # --- Check for overshoot(not enough data at the tail). this allows the calculate the missing in the next for loop
-                    if end_index > len(all_ifgs[cat[l]]):
-                    # Not enough short IFGs to form a valid closure → skip this loop
-                        loop[cat[i]][cat[l]].append(None)
-                        missing_counts[cat[i]][cat[l]] += 1
-                        continue
-
-
-
                     for e in range(t, end_index, int(cat[l]/interval)): # to record the missing ifgs index for the period of each loop
-                        #print(f"  Long baseline (cat[i]): {cat[i]}")
-                        #print(f"  Short baseline (cat[l]): {cat[l]}")
-                        #print(f"  Index t: {t}, e: {e}, end_index: {end_index}")
-                        #print(f"  len(all_ifgs[cat[l]]): {len(all_ifgs[cat[l]])}")
-
                         elem = all_ifgs[cat[l]][e]
 
                         if elem is None:
@@ -258,9 +243,11 @@ def loop_calc(max_loop):
                     else:
                         closure = np.angle( np.exp( 1j * ( np.array(all_ifgs[cat[i]][t], dtype=np.float32)- np.sum( np.array(all_ifgs[cat[l]][t:end_index:int(cat[l] / interval)], dtype=np.float32), axis=0))))
 
+
                         if cat[i] in loop:
                             loop[cat[i]][cat[l]].append(closure)
-                            loop_counts[cat[i]][cat[l]] += 1  # Increment successful loop counter
+                            loop_counts[cat[i]][cat[
+                                l]] += 1  # Increment successful loop counter
 
                         else:
                             loop[cat[i]][cat[l]] = [closure]

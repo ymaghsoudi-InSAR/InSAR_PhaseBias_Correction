@@ -83,8 +83,6 @@ config = configparser.ConfigParser()
 # Read the config.txt file
 config.read(config_file)
 
-print("Config keys:", list(config.defaults().keys()))
-
 
 # Define required parameters
 required_parameters = [
@@ -128,7 +126,6 @@ try:
     parameters["a1_12_day"] = config.getfloat("DEFAULT", "a1_12_day")
     parameters["a2_12_day"] = config.getfloat("DEFAULT", "a2_12_day")
     parameters["a3_12_day"] = config.getfloat("DEFAULT", "a3_12_day")
-    parameters["a4_12_day"] = config.getfloat("DEFAULT", "a4_12_day")
     parameters["estimate_an_values"] = config.get("DEFAULT", "estimate_an_values")
 
 except configparser.NoOptionError as e:
@@ -156,7 +153,7 @@ estimate_an_values = parameters["estimate_an_values"]
 start_date = datetime.strptime(start, "%Y%m%d")
 end_date = datetime.strptime(end, "%Y%m%d")
 
-uncor_only = 1  # in case of 1 only uses 6-12-18 uncorrected ifgs. it is based on the desired_lengths ifgs
+uncor_only = 0  # in case of 1 only uses 6-12-18 uncorrected ifgs. it is based on the desired_lengths ifgs
 max_con = 5  # in case of 5, it will correct up to 6*5=30-day ifgs.
 
 
@@ -299,22 +296,21 @@ print("\nReading data completed.")
 
 ######## stacking all the ifgs 6/12/18 in a numpy var all_ifgs
 desired_categories = desired_lengths
-print('stacking all the ifgs 6/12/18 in a numpy var all_ifgs')
+
 all_ifgs, all_coh, existing_ifgs_index = read_orig_ifgs_coh(
     ifgs, coh, desired_categories
 )
-print('stacking completed')
+
 
 del ifgs, coh
 gc.collect()
 
-print('ifgs coh deleted')
 ##### Reading the estimated bias terms as well as the indices of unknowns that can be corrected obtained in step 03  ##############
 ##############################################################################################
 print("Correcting the interferograms...")
 # Define the path components
 sub_dir = "Data"
-filename_pattern_X = "X_base_ifgs_biases.npy"  # Pattern to match files starting with "X_base"
+filename_pattern_X = "X_base*"  # Pattern to match files starting with "X_base"
 filename_pattern_indices = "indices*"
 
 # Construct the full file path with the refined pattern
@@ -323,14 +319,17 @@ file_path_pattern_indices = os.path.join(output_path, sub_dir, filename_pattern_
 
 # Use glob to find the file and ensure it exists
 file_list = glob.glob(file_path_pattern_X)
-
 if file_list:
-    file_path = file_list[0]  # string path to .npy file
-    X = np.load(file_path, mmap_mode="r")  # ✅ correct way
+    file_path = file_list[0]  # Get the single file path directly
+
+    # Load the data from the file
+    with open(file_path, "rb") as file:
+        X = np.load(file)
 else:
-    raise FileNotFoundError(f"No file matching '{filename_pattern_X}' was found in '{os.path.join(output_path, sub_dir)}'.")
-
-
+    raise FileNotFoundError(
+        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
+    )
+# print('Reading ifgs completed.')
 
 # Use glob to find the file and ensure it exists
 file_list = glob.glob(file_path_pattern_indices)
@@ -368,11 +367,10 @@ X_extended = (
 
 extended_indices = extended_indices.tolist()
 X_extended = X_extended.tolist()
-print('indices loaded')
+
 
 # Generalized loop to handle any max_con
 for n in range(2, max_con + 1):  # Start from 2*interval and go up to (max_con)*interval
-    print('n is ', n)
     current_length = n * interval  # Calculate the length (e.g., 12, 18, 24, ...)
 
     if current_length in desired_lengths:  # Check if this length is required
@@ -381,13 +379,9 @@ for n in range(2, max_con + 1):  # Start from 2*interval and go up to (max_con)*
             extended_indices.append(last_item + 1)  # Append the new index
 
             # Sum up X values for the current length (n)
-#            X_sum = sum(
-#                X[i + j, :, :] for j in range(n)
-#            )  # Sum over n consecutive indices
-
-
-            X_sum = X[i : i + n].sum(axis=0) # more efficient
-
+            X_sum = sum(
+                X[i + j, :, :] for j in range(n)
+            )  # Sum over n consecutive indices
 
             # Append the result to X_extended using the corresponding an_values
             X_extended.append(
@@ -399,68 +393,25 @@ for n in range(2, max_con + 1):  # Start from 2*interval and go up to (max_con)*
 X = np.array(X_extended)
 indices_unknown_tobe_corrected = extended_indices
 del X_extended
-print('X extended')
 
 
 #### correcting the ifgs (6/12/18) ########################
 #################################################################
+all_ifgs_cor = np.full_like(all_ifgs, None)
+all_ifgs_cor[:, :, :] = np.nan
 
-
-#######  v3
-def wrap_to_pi_inplace(arr):
-    np.remainder(arr + np.pi, 2*np.pi, out=arr)
-    arr -= np.pi
-    return arr
-
-print(f"all_ifgs.shape: {all_ifgs.shape}")
-print(f"len(indices_unknown_tobe_corrected): {len(indices_unknown_tobe_corrected)}")
-print(f"len(X): {len(X)}")
-
-all_ifgs_cor = np.full(all_ifgs.shape, np.nan, dtype=np.float32)
 if uncor_only == 0:  # if we want to use the corrected ifgs (using wrapped phases)
-    batch_size = 1  # adjust based on memory
-    for i in range(0, len(indices_unknown_tobe_corrected), batch_size):
-        print('batch ', i)
-        idx = indices_unknown_tobe_corrected[i:i+batch_size]
-        arr = all_ifgs[idx] - X[i:i+batch_size]
-        wrap_to_pi_inplace(arr)
-        all_ifgs_cor[idx] = arr
-else:
-    print("uncor_only = 1 → skipping correction, copying originals")
-    all_ifgs_cor[indices_unknown_tobe_corrected] = all_ifgs[indices_unknown_tobe_corrected]
+    all_ifgs_cor[indices_unknown_tobe_corrected, :, :] = np.angle(
+        np.exp(
+            complex(0 + 1j)
+            * (all_ifgs[indices_unknown_tobe_corrected, :, :] - X[:, :, :])
+        )
+    )
+else:  # no need for correction
+    all_ifgs_cor[indices_unknown_tobe_corrected, :, :] = all_ifgs[
+        indices_unknown_tobe_corrected, :, :
+    ]
 
-##################  v2
-#def wrap_to_pi(x):
-#    """Wrap values to [-pi, pi)."""
-#    return (x + np.pi) % (2 * np.pi) - np.pi
-#
-## Preallocate directly as float array filled with NaN
-#all_ifgs_cor = np.full(all_ifgs.shape, np.nan, dtype=np.float32)
-#
-#if uncor_only == 0:  # use corrected ifgs (wrapped phases)
-#    print('uncor_only 0')
-#    all_ifgs_cor[indices_unknown_tobe_corrected] = wrap_to_pi(all_ifgs[indices_unknown_tobe_corrected] - X)
-#else:  # no correction, just copy
-#    all_ifgs_cor[indices_unknown_tobe_corrected] = all_ifgs[indices_unknown_tobe_corrected]
-
-############### #  v1
-# this was less efficient and so I replaced it with above
-#all_ifgs_cor = np.full_like(all_ifgs, None)
-#all_ifgs_cor[:, :, :] = np.nan
-#
-#if uncor_only == 0:  # if we want to use the corrected ifgs (using wrapped phases)
-#    all_ifgs_cor[indices_unknown_tobe_corrected, :, :] = np.angle(
-#        np.exp(
-#            complex(0 + 1j)
-#            * (all_ifgs[indices_unknown_tobe_corrected, :, :] - X[:, :, :])
-#        )
-#    )
-#else:  # no need for correction
-#    all_ifgs_cor[indices_unknown_tobe_corrected, :, :] = all_ifgs[
-#        indices_unknown_tobe_corrected, :, :
-#    ]
-#
-print ('before outputting')
 
 ### Outputting to disk  ################
 #############################################################################
@@ -476,17 +427,12 @@ os.makedirs(
 )  # create the GEOC directory if it doesn't exist
 
 template_tif_path = os.path.join(root_directory, metadata_dir, frame + ".geo.hgt.tif")
-print('template_tif_path', template_tif_path)
+
 if nlook != 1:
     resampled_tif_path = os.path.join(output_wrap_dir, frame + ".geo.hgt.tif")
-    print('template_tif_path', template_tif_path)
-    print('resampled_tif_path', resampled_tif_path)
-    print('nlook ', nlook)
-
     resample_geotiff(template_tif_path, resampled_tif_path, nlook)
     template_tif_path = resampled_tif_path
 
-print('resample complete')
 
 total_files = len(all_ifgs)  # Total number of interferograms
 processed_files = 0  # Counter for processed files

@@ -298,7 +298,7 @@ def plot_an(an_arrays, mean_a_long_baseline, k):
             ax_hist.set_title(
                 f"{i+1}th $a_{{{k-1}}}$ Histogram"
             )  # Dynamically set title
-            ax_hist.set_xlim([-3, 3])  # Adjust histogram range as needed
+            ax_hist.set_xlim([-10, 10])  # Adjust histogram range as needed
 
         plt.tight_layout()
         plt.show()

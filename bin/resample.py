@@ -3,6 +3,7 @@
 
 import rasterio
 from rasterio.enums import Resampling
+import os
 frame = '022D_04826_121209'
 frame ='145A_05047_000706'
 frame ='082D_05128_030500'
@@ -19,7 +20,11 @@ if track[0]=='0':
 
 
 def resample_geotiff(input_path, output_path, scale_factor):
+
+
     with rasterio.open(input_path) as src:
+
+
         # Get the original geotransform and metadata
         transform = src.transform
         metadata = src.meta.copy()
