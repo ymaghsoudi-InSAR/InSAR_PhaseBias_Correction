@@ -1,91 +1,67 @@
 #!/usr/bin/env python3
 
-import numpy as np
-import pickle
-import glob
-import configparser
 import os
 import sys
+import glob
+import pickle
 import warnings
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
+import configparser
+
+import numpy as np
+
+warnings.filterwarnings("ignore", category=np.exceptions.VisibleDeprecationWarning)
 
 ################################################################################################
 
 HELP_TEXT = """
-PhaseBias_02_Loop_Closures.py
+PhaseBias_02_Loop_Closures_Chunked.py
 
-This script calculates loop closures (Δφ) using the interferograms imported in the first step. 
+This script calculates loop closures (Δφ) using the chunked interferograms
+written by the chunked version of PhaseBias_01_Read_Data.py.
 
 Definition of Loop Closures:
-Loop closures, Δφ, are calculated for the epochs between `i` and `k`, and are defined as:
-    Δφ_(i,k) = |φ_(i,k) - ∑_(t=i)^k φ_(t,t+1)|_2π 
-
-Where:
-- φ_(i,j): Represents the phase difference for a pixel in the interferogram formed between epochs `i` and `j`.
-- |.|_2π: Indicates that the result is wrapped modulo 2π (i.e., values range from -π to π).
-
-Key Information:
-- Nonzero closure phase is a by-product of spatial filtering/multilooking and is primarily associated with changes in the scattering and electrical properties of the ground surface.
-- The calculated loop closures are based on the minimum temporal-baseline interferograms defined in the configuration file (parameter: `interval`) and are referred to as base interferograms. These may represent:
-  - 12- and 6-day closures (or 24- and 12-day closures), Δφ_(i,i+2)
-  - 18- and 6-day closures (or 36- and 12-day closures), Δφ_(i,i+3)
-  The distinction depends on whether the base interferograms are 6-day or 12-day intervals.
+    Δφ_(i,k) = | φ_(i,k) - Σ φ_(t,t+Δt) |_2π
 
 Outputs:
-- The calculated loop closures are stored as a dictionary in a file named:
-  `All_loops_start_end.pkl`
-- The output is saved in the directory `Data/` under the `output_path` defined in the configuration file.
+1. Chunked loop-closure files:
+   Data/loops/<long>_<short>/chunk_rXXX_cXXX.pkl
 
-Loop Closure Report:
-At the end of the script, a loop closure report is displayed. This report includes:
-- The number of generated and missing loop closures for short-interval closures, such as 12-6 and 18-6.
-- The number of generated and missing long-interval closures, obtained using long-term interferograms, such as 204-6 and 204-12.
+2. Chunked missing-index files:
+   Data/missing/<category>d/chunk_rXXX_cXXX.pkl
 
-Usage:
-1. Ensure the interferograms from the first script are available.
-2. Run the script to generate loop closures for the specified temporal baselines.
+3. Data/loop_index.pkl
+   Metadata describing the generated loop products.
 
-Example:
-```bash
-python PhaseBias_02_Loop_Closures.py
-
-
+Each loop chunk file contains:
+- data           : list of arrays / None
+- long_baseline  : e.g. 12
+- short_baseline : e.g. 6
+- chunk_id       : (row_chunk_index, col_chunk_index)
+- row_range      : (r0, r1)
+- col_range      : (c0, c1)
+- valid_fraction : valid land fraction in this chunk
 """
+
 if "--help" in sys.argv:
     print(HELP_TEXT)
     sys.exit(0)
 
 ################################################################################################
-# Config file path
+# Config
+################################################################################################
+
 config_file = "config.txt"
 
-# Check if config file exists
 if not os.path.exists(config_file):
     raise FileNotFoundError(
         f"Error: The configuration file '{config_file}' was not found in the script's directory."
     )
 
-# Initialize the configparser
 config = configparser.ConfigParser()
-
-# Read the config.txt file
 config.read(config_file)
 
-# Define required parameters
-required_parameters = [
-    "root_path",
-    "frame",
-    "start",
-    "end",
-    "interval",
-    "nlook",
-    "LiCSAR_data",
-]
-
-# Initialize a dictionary to store parameters
 parameters = {}
 
-# Attempt to retrieve each parameter and catch errors
 try:
     parameters["root_path"] = config.get("DEFAULT", "root_path")
     parameters["output_path"] = config.get("DEFAULT", "output_path")
@@ -93,21 +69,16 @@ try:
     parameters["start"] = config.get("DEFAULT", "start")
     parameters["end"] = config.get("DEFAULT", "end")
     parameters["interval"] = config.getint("DEFAULT", "interval")
-    parameters["nlook"] = config.getint(
-        "DEFAULT", "nlook")  # Assuming 'nlook' should be an integer
+    parameters["nlook"] = config.getint("DEFAULT", "nlook")
     parameters["LiCSAR_data"] = config.get("DEFAULT", "LiCSAR_data")
-
 except configparser.NoOptionError as e:
-    # Error message if a required parameter is missing
     missing_param = str(e).split(": ")[1]
     raise ValueError(
         f"Error: Required parameter '{missing_param}' is missing in '{config_file}'. Please check the file contents."
     )
 except configparser.Error as e:
-    # General error for any configparser-related issues
     raise ValueError(f"Error while reading '{config_file}': {e}")
 
-# Assign to individual variables for easy access
 root_path = parameters["root_path"]
 output_path = parameters["output_path"]
 frame = parameters["frame"]
@@ -117,207 +88,406 @@ interval = parameters["interval"]
 nlook = parameters["nlook"]
 LiCSAR_data = parameters["LiCSAR_data"]
 
-# hardcoded parameters, not included in the config file
+# hardcoded parameters
 landmask = 1
 filtered_ifgs = "yes"
-max_loop = 5  # in case of 3 all loops with 6,12,18-day will be calculated (e.g. (60,6), (60,12) and (60,18))
+max_loop = 5
+
+print("Root Path:", root_path)
+print("Output Path:", output_path)
+print("Frame:", frame)
+print("Start Date:", start)
+print("End Date:", end)
+print("Interval:", interval)
+print("nlook:", nlook)
+print("LiCSAR_data:", LiCSAR_data)
+print("max_loop:", max_loop)
+
+################################################################################################
+# Helpers
+################################################################################################
+
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-#############################################################################################
-#################################################################################################
-def loop_calc(max_loop):
+def save_pickle(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
 
-    ## Read ifgs:
 
-    # Define the path components
-    sub_dir = "Data"
-    filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
-
-    # Construct the full file path with the refined pattern
-    file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-    # Use glob to find the file and ensure it exists
-    file_list = glob.glob(file_path_pattern)
-    if file_list:
-        file_path = file_list[0]  # Get the single file path directly
-
-        # Load the data from the file
-        with open(file_path, "rb") as file:
-            all_ifgs = pickle.load(file)
-    else:
+def load_chunk_index(data_dir):
+    chunk_index_file = os.path.join(data_dir, "chunk_index.pkl")
+    if not os.path.exists(chunk_index_file):
         raise FileNotFoundError(
-            f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
+            f"Chunk index not found: {chunk_index_file}\n"
+            f"Please run the chunked PhaseBias_01_Read_Data.py first."
         )
+    return load_pickle(chunk_index_file)
 
+
+def load_ifg_chunk(data_dir, category, chunk_id):
+    cr, cc = chunk_id
+    path = os.path.join(
+        data_dir,
+        "ifgs",
+        f"{category}d",
+        f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+    )
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
+
+
+def load_all_ifg_categories_for_chunk(data_dir, categories, chunk_id):
+    all_ifgs = {}
+    chunk_meta = None
+
+    for category in categories:
+        payload = load_ifg_chunk(data_dir, category, chunk_id)
+        if payload is not None:
+            all_ifgs[category] = payload["data"]
+            if chunk_meta is None:
+                chunk_meta = {
+                    "chunk_id": payload["chunk_id"],
+                    "row_range": payload["row_range"],
+                    "col_range": payload["col_range"],
+                    "valid_fraction": payload["valid_fraction"],
+                }
+
+    return all_ifgs, chunk_meta
+
+
+def initialise_loop_dict(cat, max_loop):
     loop = {}
     missing = {}
 
-    cat = sorted(all_ifgs.keys())  # Get sorted categories
-    # print('cat = ', cat)
-
-    # Initialize counters for reporting
-    loop_counts = {
-        category: {
-            cat[l]: 0
-            for l in range(max_loop)
-        }
-        for category in sorted(all_ifgs.keys())
-    }
-    missing_counts = {
-        category: {
-            cat[l]: 0
-            for l in range(max_loop)
-        }
-        for category in sorted(all_ifgs.keys())
-    }
-
     for category in cat:
-        loop[category] = {
-        }  # Initialize the key in the loop dictionary with an inner dictionary
-        missing[category] = []  # second ver
-        for l in range(
-                max_loop
-        ):  # it was up to 3 in the first version. but this allows to go for longer loops e.g. 288-72 (cat[11] is 72)
-            loop[category][cat[l]] = [
-            ]  # Initialize the key in the inner dictionary
-    #            missing[cat[l]] = [] # first ver
-    # Calculate total iterations for progress percentage
-    total_iterations = sum(
-        len(all_ifgs[cat[i]]) for l in range(max_loop)
-        for i in range(1, len(cat))
-        if cat[i] % cat[l] == 0 and cat[i] != cat[l])
-    completed_iterations = 0
+        loop[category] = {}
+        missing[category] = []
 
-    # Display the message before starting the progress bar
-    print(
-        f"Calculating all {interval}, {2 * interval}, and {3 * interval} loop closures."
-    )
-
-    for l in range(
-            0, max_loop
-    ):  # l could be 6, 12 and 18 to calculate e.g. 36-6 or 36-12 or 36-18
-        for i in range(1, len(cat)):  # index for the category e.g. 6, 12, 18
-            if cat[i] % cat[l] == 0 and cat[i] != cat[
-                    l]:  # such as 12/6 or 24/12
-                for t in range(len(all_ifgs[
-                        cat[i]])):  # index for the epochs in each category
-
-                    ####################progress bar
-                    completed_iterations += 1
-                    percentage = (completed_iterations /
-                                  total_iterations) * 100
-
-                    # Display progress percentage
-                    sys.stdout.write("\rProgress: [{:<50}] {}%".format(
-                        "=" * int(percentage // 2), int(percentage)))
-                    sys.stdout.flush()
-                    ##################################
-
-                    if cat[l] == interval:
-                        end_index = t + int(cat[i] / cat[l])
-                        # print('end_index = ', end_index)
-                    else:
-                        end_index = t + int(cat[i] / cat[l]) * int(
-                            cat[l] / interval)
-
-                    # recording the missing ifgs in each cat e.g. 6,12,18
-                    #if np.any(np.array(all_ifgs[cat[i]])[t] == None):
-                    if np.any(np.array(all_ifgs[cat[i]], dtype=object)[t] == None):    
-                        missing[cat[i]].append(
-                            t
-                        )  # to record the missing ifgs index for each cateogory e.g. 18
-
-
-
-                    # --- Check for overshoot(not enough data at the tail). this allows the calculate the missing in the next for loop
-                    if end_index > len(all_ifgs[cat[l]]):
-                    # Not enough short IFGs to form a valid closure → skip this loop
-                        loop[cat[i]][cat[l]].append(None)
-                        missing_counts[cat[i]][cat[l]] += 1
-                        continue
-
-
-
-                    for e in range(t, end_index, int(cat[l]/interval)): # to record the missing ifgs index for the period of each loop
-                        #print(f"  Long baseline (cat[i]): {cat[i]}")
-                        #print(f"  Short baseline (cat[l]): {cat[l]}")
-                        #print(f"  Index t: {t}, e: {e}, end_index: {end_index}")
-                        #print(f"  len(all_ifgs[cat[l]]): {len(all_ifgs[cat[l]])}")
-
-                        elem = all_ifgs[cat[l]][e]
-
-                        if elem is None:
-                            missing[cat[l]].append(e)
-
-
-
-                    if all_ifgs[cat[i]][t] is None or any(all_ifgs[cat[l]][elem] is None for elem in range(t, end_index, int(cat[l] / interval))):
-
-                        loop[cat[i]][cat[l]].append(None)
-                        missing_counts[cat[i]][cat[l]] += 1  # Increment missing loop counter
-
-                    else:
-                        closure = np.angle( np.exp( 1j * ( np.array(all_ifgs[cat[i]][t], dtype=np.float32)- np.sum( np.array(all_ifgs[cat[l]][t:end_index:int(cat[l] / interval)], dtype=np.float32), axis=0))))
-
-                        if cat[i] in loop:
-                            loop[cat[i]][cat[l]].append(closure)
-                            loop_counts[cat[i]][cat[l]] += 1  # Increment successful loop counter
-
-                        else:
-                            loop[cat[i]][cat[l]] = [closure]
-    print("\n Finished calculating the loop closures.")
-
-    # Generate report
-    print("\n=== Loop Closure Report ===")
-    for category in [
-            2 * interval,
-            3 * interval,
-    ]:  # Restrict to relevant categories e.g. 18-6 and 12-6 as the main observations
-        for l in [interval]:  # Restrict to the loop levels of interest
-            if category in loop_counts and l in loop_counts[category]:
-                generated = loop_counts[category].get(l, 0)
-                missing = missing_counts[category].get(l, 0)
-                print(
-                    f"Loop Closure {category} - {l}: Generated = {generated}, Missing = {missing}"
-                )
-
-    print("\n=== Loop Closure Report for Long-interval Loop Closures ===")
-
-    # Iterate over categories greater than 200
-    for category in cat:
-        if category > 200:  # Check for long categories
-            for l in range(
-                    1,
-                    5 * interval):  # Check loop levels less than 5 * interval
-                if category in loop_counts and l in loop_counts[category]:
-                    generated = loop_counts[category].get(l, 0)
-                    if generated >= 1:  # Only report if at least one loop is generated
-                        print(
-                            f"Loop Closure {category} - {l}: Generated = {generated}"
-                        )
+        max_l = min(max_loop, len(cat))
+        for l in range(max_l):
+            loop[category][cat[l]] = []
 
     return loop, missing
 
 
+def calculate_total_iterations(all_ifgs, cat, max_loop):
+    total_iterations = 0
+    max_l = min(max_loop, len(cat))
+
+    for l in range(max_l):
+        for i in range(1, len(cat)):
+            if cat[i] % cat[l] == 0 and cat[i] != cat[l]:
+                total_iterations += len(all_ifgs[cat[i]])
+
+    return total_iterations
+
+
+################################################################################################
+# Core loop calculator for one chunk
 ################################################################################################
 
-all_loops, missing = loop_calc(max_loop)
+def loop_calc_chunk(all_ifgs, max_loop, interval, show_progress=False):
+    """
+    all_ifgs:
+        dict like {6: [arr/None, arr/None, ...], 12: [...], ...}
+        for one chunk only
+    """
+    if len(all_ifgs) == 0:
+        return {}, {}, {}, {}
 
-# Define the directory path
-directory_path = os.path.join(output_path, "Data")
+    cat = sorted(all_ifgs.keys())
+    loop, missing = initialise_loop_dict(cat, max_loop)
 
-# Create the directory if it doesn't exist
-os.makedirs(directory_path, exist_ok=True)
+    loop_counts = {
+        category: {
+            cat[l]: 0
+            for l in range(min(max_loop, len(cat)))
+        }
+        for category in cat
+    }
 
-# Define the file path
-file_path = os.path.join(directory_path, f"All_loops_{start}_{end}.pkl")
+    missing_counts = {
+        category: {
+            cat[l]: 0
+            for l in range(min(max_loop, len(cat)))
+        }
+        for category in cat
+    }
 
-with open(file_path, "wb") as file:  # for writting a dictionary to a file
-    pickle.dump(all_loops, file)
+    total_iterations = calculate_total_iterations(all_ifgs, cat, max_loop)
+    completed_iterations = 0
 
-###
+    if show_progress:
+        print(
+            f"Calculating all {interval}, {2 * interval}, and {3 * interval} loop closures for this chunk."
+        )
 
-# Define the file path
-file_path = os.path.join(directory_path, f"missing_loops")
+    max_l = min(max_loop, len(cat))
 
-with open(file_path, "wb") as file:  # for writting a dictionary to a file
-    pickle.dump(missing, file)
+    for l in range(max_l):
+        for i in range(1, len(cat)):
+            if cat[i] % cat[l] == 0 and cat[i] != cat[l]:
+                for t in range(len(all_ifgs[cat[i]])):
+                    completed_iterations += 1
+
+                    if show_progress and total_iterations > 0:
+                        percentage = (completed_iterations / total_iterations) * 100
+                        sys.stdout.write(
+                            "\rProgress: [{:<50}] {}%".format(
+                                "=" * int(percentage // 2), int(percentage)
+                            )
+                        )
+                        sys.stdout.flush()
+
+                    if cat[l] == interval:
+                        end_index = t + int(cat[i] / cat[l])
+                    else:
+                        end_index = t + int(cat[i] / cat[l]) * int(cat[l] / interval)
+
+                    # record missing long IFG
+                    if np.any(np.array(all_ifgs[cat[i]], dtype=object)[t] == None):
+                        missing[cat[i]].append(t)
+
+                    # overshoot check
+                    if end_index > len(all_ifgs[cat[l]]):
+                        loop[cat[i]][cat[l]].append(None)
+                        missing_counts[cat[i]][cat[l]] += 1
+                        continue
+
+                    # record missing short IFGs contributing to this loop
+                    for e in range(t, end_index, int(cat[l] / interval)):
+                        elem = all_ifgs[cat[l]][e]
+                        if elem is None:
+                            missing[cat[l]].append(e)
+
+                    if (
+                        all_ifgs[cat[i]][t] is None
+                        or any(
+                            all_ifgs[cat[l]][elem] is None
+                            for elem in range(t, end_index, int(cat[l] / interval))
+                        )
+                    ):
+                        loop[cat[i]][cat[l]].append(None)
+                        missing_counts[cat[i]][cat[l]] += 1
+                    else:
+                        closure = np.angle(
+                            np.exp(
+                                1j
+                                * (
+                                    np.array(all_ifgs[cat[i]][t], dtype=np.float32)
+                                    - np.sum(
+                                        np.array(
+                                            all_ifgs[cat[l]][t:end_index:int(cat[l] / interval)],
+                                            dtype=np.float32
+                                        ),
+                                        axis=0,
+                                    )
+                                )
+                            )
+                        )
+
+                        loop[cat[i]][cat[l]].append(closure)
+                        loop_counts[cat[i]][cat[l]] += 1
+
+    if show_progress:
+        print("\nFinished calculating the loop closures for this chunk.")
+
+    return loop, missing, loop_counts, missing_counts
+
+
+################################################################################################
+# Writers
+################################################################################################
+
+def save_loop_chunk(data_dir, long_baseline, short_baseline, chunk_meta, data_list):
+    cr, cc = chunk_meta["chunk_id"]
+    out_path = os.path.join(
+        data_dir,
+        "loops",
+        f"{long_baseline}_{short_baseline}",
+        f"chunk_r{cr:03d}_c{cc:03d}.pkl",
+    )
+
+    payload = {
+        "data": data_list,
+        "long_baseline": long_baseline,
+        "short_baseline": short_baseline,
+        "chunk_id": chunk_meta["chunk_id"],
+        "row_range": chunk_meta["row_range"],
+        "col_range": chunk_meta["col_range"],
+        "valid_fraction": chunk_meta["valid_fraction"],
+    }
+
+    save_pickle(out_path, payload)
+
+
+def save_missing_chunk(data_dir, category, chunk_meta, missing_list):
+    cr, cc = chunk_meta["chunk_id"]
+    out_path = os.path.join(
+        data_dir,
+        "missing",
+        f"{category}d",
+        f"chunk_r{cr:03d}_c{cc:03d}.pkl",
+    )
+
+    payload = {
+        "missing_indices": sorted(list(set(missing_list))),
+        "category": category,
+        "chunk_id": chunk_meta["chunk_id"],
+        "row_range": chunk_meta["row_range"],
+        "col_range": chunk_meta["col_range"],
+        "valid_fraction": chunk_meta["valid_fraction"],
+    }
+
+    save_pickle(out_path, payload)
+
+
+################################################################################################
+# Main
+################################################################################################
+
+def main():
+    data_dir = os.path.join(output_path, "Data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    chunk_index = load_chunk_index(data_dir)
+    valid_chunks = chunk_index["valid_chunks"]
+    categories_ifgs = sorted(chunk_index["categories_ifgs"])
+
+    print(f"Number of valid chunks: {len(valid_chunks)}")
+    print(f"IFG categories available: {categories_ifgs}")
+
+    overall_loop_counts = {}
+    overall_missing_counts = {}
+
+    for category in categories_ifgs:
+        overall_loop_counts[category] = {}
+        overall_missing_counts[category] = {}
+        for short_cat in categories_ifgs[:min(max_loop, len(categories_ifgs))]:
+            overall_loop_counts[category][short_cat] = 0
+            overall_missing_counts[category][short_cat] = 0
+
+    total_chunks = len(valid_chunks)
+    processed_chunks = 0
+
+    print("\nCalculating loop closures chunk by chunk...")
+
+    for chunk_id in valid_chunks:
+        processed_chunks += 1
+        cr, cc = chunk_id
+
+        pct = 100.0 * processed_chunks / total_chunks
+        sys.stdout.write(
+            f"\rChunk progress: [{'=' * int(pct // 2):<50}] {int(pct)}% "
+            f"(chunk r{cr:03d}, c{cc:03d})"
+        )
+        sys.stdout.flush()
+
+        all_ifgs, chunk_meta = load_all_ifg_categories_for_chunk(
+            data_dir, categories_ifgs, chunk_id
+        )
+
+        if len(all_ifgs) == 0 or chunk_meta is None:
+            continue
+
+        loop, missing, loop_counts, missing_counts = loop_calc_chunk(
+            all_ifgs=all_ifgs,
+            max_loop=max_loop,
+            interval=interval,
+            show_progress=False,
+        )
+
+        # save loops
+        for long_baseline in sorted(loop.keys()):
+            for short_baseline in sorted(loop[long_baseline].keys()):
+                save_loop_chunk(
+                    data_dir=data_dir,
+                    long_baseline=long_baseline,
+                    short_baseline=short_baseline,
+                    chunk_meta=chunk_meta,
+                    data_list=loop[long_baseline][short_baseline],
+                )
+
+                overall_loop_counts[long_baseline][short_baseline] += sum(
+                    1 for item in loop[long_baseline][short_baseline] if item is not None
+                )
+                overall_missing_counts[long_baseline][short_baseline] += sum(
+                    1 for item in loop[long_baseline][short_baseline] if item is None
+                )
+
+        # save missing
+        for category in sorted(missing.keys()):
+            save_missing_chunk(
+                data_dir=data_dir,
+                category=category,
+                chunk_meta=chunk_meta,
+                missing_list=missing[category],
+            )
+
+    print("\nFinished calculating chunked loop closures.")
+
+    ################################################################################################
+    # Reports
+    ################################################################################################
+
+    print("\n=== Loop Closure Report ===")
+    for category in [2 * interval, 3 * interval]:
+        if category not in overall_loop_counts:
+            continue
+        short_category = interval
+        if short_category in overall_loop_counts[category]:
+            generated = overall_loop_counts[category][short_category]
+            missing_val = overall_missing_counts[category][short_category]
+            print(
+                f"Loop Closure {category} - {short_category}: Generated = {generated}, Missing = {missing_val}"
+            )
+
+    print("\n=== Loop Closure Report for Long-interval Loop Closures ===")
+    for category in categories_ifgs:
+        if category > 200:
+            for short_category in categories_ifgs[:min(max_loop, len(categories_ifgs))]:
+                if short_category in overall_loop_counts[category]:
+                    generated = overall_loop_counts[category][short_category]
+                    if generated >= 1:
+                        print(
+                            f"Loop Closure {category} - {short_category}: Generated = {generated}"
+                        )
+
+    ################################################################################################
+    # loop index
+    ################################################################################################
+
+    loop_products = []
+    for long_baseline in categories_ifgs:
+        for short_baseline in categories_ifgs[:min(max_loop, len(categories_ifgs))]:
+            if long_baseline % short_baseline == 0 and long_baseline != short_baseline:
+                loop_products.append((long_baseline, short_baseline))
+
+    loop_index = {
+        "frame": frame,
+        "start": start,
+        "end": end,
+        "interval": interval,
+        "nlook": nlook,
+        "LiCSAR_data": LiCSAR_data,
+        "max_loop": max_loop,
+        "valid_chunks": valid_chunks,
+        "categories_ifgs": categories_ifgs,
+        "loop_products": loop_products,
+        "overall_loop_counts": overall_loop_counts,
+        "overall_missing_counts": overall_missing_counts,
+    }
+
+    loop_index_file = os.path.join(data_dir, "loop_index.pkl")
+    save_pickle(loop_index_file, loop_index)
+
+    print(f"\nLoop index written to: {loop_index_file}")
+
+
+if __name__ == "__main__":
+    main()

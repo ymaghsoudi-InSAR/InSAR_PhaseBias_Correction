@@ -1,683 +1,859 @@
 #!/usr/bin/env python3
 
-import numpy as np
-import pickle
 import os
+import sys
+import gc
+import pickle
+import warnings
+import configparser
+import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
 from scipy.sparse import csc_array
 from scipy.sparse.linalg import lsqr
-import sys
-import math
-from bin.read_orig_ifgs_coh import read_orig_ifgs_coh
+
 from bin.circular_mean_var import circular_mean_and_variance_over_epochs
-import glob
-import configparser
-import warnings
 
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
-
-################################################################################
+warnings.filterwarnings("ignore", category=np.exceptions.VisibleDeprecationWarning)
 
 HELP_TEXT = """
-PhaseBias_04_Inversion.py
+PhaseBias_03_Phase_Bias_Estimation_Chunked.py
 
-This script estimates the phase bias terms for the base interferograms using short-term closure phases as input. 
-The bias terms derived in this step serve as the foundation for correcting other short-term interferograms.
+This script estimates the phase-bias terms for the base interferograms using
+short-term loop closures as observations, chunk by chunk.
 
-### Workflow:
-1. **Masking Noisy Loop Closures:**
-   - A moving average is applied to the time-series of loop closures to account for seasonal fluctuations.
-   - A circular moving average (mean of complex values over time) is computed for each pixel.
-   - The distance of each loop closure from the moving average is calculated. If the distance exceeds a threshold (2σ), the point is masked as noisy.
-   - The circular standard deviation (σ) is computed using the von Mises distribution (circular normal distribution).
+It uses only:
+- loop closures: (2*interval, interval) and (3*interval, interval)
+- coherence: interval, 2*interval, 3*interval
 
-2. **Refined Loop Closures:**
-   - Masked loop closures, denoted as 〖Δφ〗_(i,i+2)^r and 〖Δφ〗_(i,i+3)^r, are used as primary observations for phase bias estimation.
+The source of the calibration parameters a1 and a2 is controlled by:
+    estimate_an_mode = config | global | pixel
 
-3. **First Inversion (Without Temporal Smoothing Constraints):**
-   - Estimates the bias terms that can be corrected directly from the observed loop closures.
+Modes:
+- config : use scalar a1/a2 values from config.txt
+- global : use chunkwise scalar a1/a2 values from Data/an_chunks/global_clean/
+           (fallback to Data/an_chunks/global/, then config values)
+- pixel  : use chunkwise pixel-wise a1/a2 maps from Data/an_chunks/pixel_maps/
+           (fallback to chunkwise global, then config values)
 
-4. **Second Inversion (With Temporal Smoothing Constraints):**
-   - Incorporates temporal smoothing constraints to estimate additional bias terms that cannot be directly derived from loop closures.
-   - The temporal smoothing minimizes differences between bias terms over time, ensuring consistency.
+Outputs:
+- Data/X_chunks/chunk_rXXX_cXXX.pkl
+- Data/X_chunks/x_chunk_index.pkl
 
-5. **Combining Results:**
-   - Bias terms from the first inversion are combined with the results of the second inversion to include terms not estimated in the first round.
-
-### Outputs:
-- The phase bias terms for the base interferograms are stored as a NumPy array file:
-  - `X_base_ifgs_biases.npy`, saved in the `Data` directory under the `output_path` defined in `config.txt`.
-
-
-### Input Requirements:
-- Short-term closure phases (from `PhaseBias_02_Loop_Closures.py`).
-- Configuration parameters, including thresholds and temporal settings, defined in `config.txt`.
-
-### Output Files:
-- `X_base_ifgs_biases.npy`: Stores the estimated bias terms for the base interferograms.
+This script parallelises naturally over chunks.
 """
 
 if "--help" in sys.argv:
     print(HELP_TEXT)
     sys.exit(0)
 
-###############################################################################
-# Config file path
-config_file = "config.txt"
 
-# Check if config file exists
-if not os.path.exists(config_file):
-    raise FileNotFoundError(
-        f"Error: The configuration file '{config_file}' was not found in the script's directory."
-    )
+# ======================================================================================
+# Config / IO helpers
+# ======================================================================================
 
-# Initialize the configparser
-config = configparser.ConfigParser()
+def read_config(config_file="config.txt"):
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(
+            f"Error: configuration file '{config_file}' not found."
+        )
 
-# Read the config.txt file
-config.read(config_file)
+    config = configparser.ConfigParser()
+    config.read(config_file)
 
-# Define required parameters
-required_parameters = [
-    "root_path",
-    "frame",
-    "start",
-    "end",
-    "interval",
-    "nlook",
-    "LiCSAR_data",
-    "a1_6_day",
-    "a2_6_day",
-    "a1_12_day",
-    "a2_12_day",
-    "estimate_an_values",
-]
-
-# Initialize a dictionary to store parameters
-parameters = {}
-
-# Attempt to retrieve each parameter and catch errors
-try:
-    parameters["root_path"] = config.get("DEFAULT", "root_path")
-    parameters["output_path"] = config.get("DEFAULT", "output_path")
-    parameters["frame"] = config.get("DEFAULT", "frame")
-    parameters["start"] = config.get("DEFAULT", "start")
-    parameters["end"] = config.get("DEFAULT", "end")
-    parameters["interval"] = config.getint("DEFAULT", "interval")
-    parameters["nlook"] = config.getint(
-        "DEFAULT", "nlook"
-    )  # Assuming 'nlook' should be an integer
-    parameters["LiCSAR_data"] = config.get("DEFAULT", "LiCSAR_data")
-    parameters["a1_6_day"] = config.getfloat("DEFAULT", "a1_6_day")
-    parameters["a2_6_day"] = config.getfloat("DEFAULT", "a2_6_day")
-    parameters["a1_12_day"] = config.getfloat("DEFAULT", "a1_12_day")
-    parameters["a2_12_day"] = config.getfloat("DEFAULT", "a2_12_day")
-    parameters["estimate_an_values"] = config.get("DEFAULT", "estimate_an_values")
-
-except configparser.NoOptionError as e:
-    # Error message if a required parameter is missing
-    missing_param = str(e).split(": ")[1]
-    raise ValueError(
-        f"Error: Required parameter '{missing_param}' is missing in '{config_file}'. Please check the file contents."
-    )
-except configparser.Error as e:
-    # General error for any configparser-related issues
-    raise ValueError(f"Error while reading '{config_file}': {e}")
-
-# Assign to individual variables for easy access
-root_path = parameters["root_path"]
-output_path = parameters["output_path"]
-frame = parameters["frame"]
-start = parameters["start"]
-end = parameters["end"]
-interval = parameters["interval"]
-nlook = parameters["nlook"]
-LiCSAR_data = parameters["LiCSAR_data"]
-estimate_an_values = parameters["estimate_an_values"]
-
-
-# Initialize a1 and a2 with None for safety
-a1 = None
-a2 = None
-
-
-print("estimate_an_values is ", estimate_an_values)
-# Check if estimate_an_values is 'yes'
-if estimate_an_values == "yes":
-    an_file_path = os.path.join(output_path, "Data", "an.txt")
-
-    # Try reading the file
+    params = {}
     try:
-        if os.path.exists(an_file_path):
-            print(f"Reading 'a' values from {an_file_path}...")
+        params["root_path"] = config.get("DEFAULT", "root_path")
+        params["output_path"] = config.get("DEFAULT", "output_path")
+        params["frame"] = config.get("DEFAULT", "frame")
+        params["start"] = config.get("DEFAULT", "start")
+        params["end"] = config.get("DEFAULT", "end")
+        params["interval"] = config.getint("DEFAULT", "interval")
+        params["nlook"] = config.getint("DEFAULT", "nlook")
+        params["LiCSAR_data"] = config.get("DEFAULT", "LiCSAR_data")
 
-            # Read the file and load the values
-            with open(an_file_path, "r") as file:
-                for line in file:
-                    line = line.strip()
-                    if line.startswith("a1="):
-                        a1 = float(line.split("=")[1])
-                    elif line.startswith("a2="):
-                        a2 = float(line.split("=")[1])
+        params["a1_6_day"] = config.getfloat("DEFAULT", "a1_6_day")
+        params["a2_6_day"] = config.getfloat("DEFAULT", "a2_6_day")
+        params["a1_12_day"] = config.getfloat("DEFAULT", "a1_12_day")
+        params["a2_12_day"] = config.getfloat("DEFAULT", "a2_12_day")
 
-            # Check if both a1 and a2 were found
-            if a1 is None or a2 is None:
-                print(
-                    "Warning: Missing a1 or a2 in an.txt. Switching to default values from config file."
-                )
-                raise ValueError("Incomplete a1 or a2 values.")
-        else:
-            print(
-                f"Warning: {an_file_path} does not exist. Switching to default values from config file."
-            )
-            raise FileNotFoundError
+        params["estimate_an_mode"] = config.get("DEFAULT", "estimate_an_mode").strip().lower()
 
-    except (FileNotFoundError, ValueError):
-        # Fallback to default values from config file
-        if interval == 6:
-            a1 = parameters["a1_6_day"]
-            a2 = parameters["a2_6_day"]
-        else:
-            a1 = parameters["a1_12_day"]
-            a2 = parameters["a2_12_day"]
-else:
-    # Use default values from the config file
-    print("Using default 'an' values from the config file.")
+    except configparser.NoOptionError as e:
+        raise ValueError(f"Missing required config parameter: {e}")
+
+    allowed_modes = {"config", "global", "pixel"}
+    if params["estimate_an_mode"] not in allowed_modes:
+        raise ValueError(
+            f"estimate_an_mode must be one of {sorted(allowed_modes)}, "
+            f"got '{params['estimate_an_mode']}'"
+        )
+
+    return params
+
+
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def save_pickle(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+
+
+def get_config_a_values(params):
+    interval = params["interval"]
     if interval == 6:
-        a1 = parameters["a1_6_day"]
-        a2 = parameters["a2_6_day"]
+        return params["a1_6_day"], params["a2_6_day"]
     else:
-        a1 = parameters["a1_12_day"]
-        a2 = parameters["a2_12_day"]
-
-# Print the chosen values
-print(f"Final values - a1: {a1}, a2: {a2}")
+        return params["a1_12_day"], params["a2_12_day"]
 
 
-##################################################### Loop Closure calculation #####################################################
-####################################################################################################################################
-####################################################################################################################################
+def load_chunk_index(output_path):
+    chunk_index_file = os.path.join(output_path, "Data", "chunk_index.pkl")
+    if not os.path.exists(chunk_index_file):
+        raise FileNotFoundError(
+            f"Chunk index not found: {chunk_index_file}\n"
+            f"Please run the chunked PhaseBias_01_Read_Data script first."
+        )
+    return load_pickle(chunk_index_file)
 
-track = frame[0:3]
-if track[0] == "0":
-    track = track[1:3]
-if track[0] == "0":
-    track = track[1:2]
 
-with_temporals = "yes" # it should be yes, if you want to incorporate the temporal constraints
-apply_to_all = "no"  # in case of with_temporal='yes', we can decide if you want to use the temporal to all ifgs (i.e. apply_to_all='yes'), or just to those that can not be corrected (i.e. apply_to_all='no')
-w = 0.1  # the weigth of the temporal smoothing constraints
-#######
-coh_thresh = 11  # threhsold on the coherence values. In this version it is off
-min_num_eq = 10  # I used 10 in all my experiments. min number of equations in the least square inversion.
+def chunk_file_path(output_path, kind, category_or_name, chunk_id, short_baseline=None):
+    cr, cc = chunk_id
 
-############################### Reading input data #############################################
-#################### Read ifgs:
-print("Reading all ifgs...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
-
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        all_ifgs = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
-print("Reading ifgs completed.")
-
-###################### Read coh:
-print("\nReading all coherence data...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
-
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        all_coh = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
-print("Reading coherence data completed.")
-
-##################### Read Loops
-
-print("\nReading all loop closures...")
-filename_pattern = "All_loops_*"  # Pattern to match files starting with "All_ifgs"
-
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        all_loops = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
-
-print("Reading loop closures completed.")
-
-all_cat = []
-for cat in all_loops:
-    all_cat.append(cat)
-
-### stacking all the ifgs 6/12/18 in a numpy var all_ifgs
-print(
-    "Extracting the required interferograms(up to 3 epochs), and the corresponding loop closures for inversion..."
-)
-desired_categories = [interval, 2 * interval, 3 * interval]
-all_ifgs, _, existing_ifgs_index = read_orig_ifgs_coh(
-    all_ifgs, all_coh, desired_categories
-)
-
-######### forming 12-6 and 18-6 loop closures from the imported data
-#################################################################
-loop_12 = np.array(all_loops[2 * interval][interval], dtype=object)
-#loop_12 = np.array(all_loops[2 * interval][interval])
-#coh_12 = np.array(all_coh[2 * interval][:])
-coh_12 = np.array(all_coh[2 * interval][:], dtype=object)
-
-#loop_18 = np.array(all_loops[3 * interval][interval])
-#coh_18 = np.array(all_coh[3 * interval][:])
-loop_18 = np.array(all_loops[3 * interval][interval], dtype=object)
-coh_18 = np.array(all_coh[3 * interval][:], dtype=object)
-
-############## finding dynamic pixel-based thresholds to remove the noisy loops
-loop_12_orig = []
-loop_18_orig = []
-none_indices12 = []
-none_indices18 = []
-
-# refine loop_12 to exclude the none indices and create loop_12_orig
-for i, arr in enumerate(loop_12):
-    if arr is not None:
-        (frame_row, frame_col) = np.shape(arr)
-        loop_12_orig.append(arr)
+    if kind == "coh":
+        return os.path.join(
+            output_path, "Data", "coh", f"{category_or_name}d", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    elif kind == "loops":
+        return os.path.join(
+            output_path, "Data", "loops", f"{category_or_name}_{short_baseline}",
+            f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    elif kind == "an_global":
+        return os.path.join(
+            output_path, "Data", "an_chunks", "global", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    elif kind == "an_global_clean":
+        return os.path.join(
+            output_path, "Data", "an_chunks", "global_clean", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    elif kind == "an_pixel":
+        return os.path.join(
+            output_path, "Data", "an_chunks", "pixel_maps", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
     else:
-        none_indices12.append(i)
+        raise ValueError(f"Unknown kind: {kind}")
 
-# refine loop_18 to exclude the none indices and create loop_18_orig
-for i, arr in enumerate(loop_18):
-    if arr is not None:
-        loop_18_orig.append(arr)
+
+def load_coh_chunk(output_path, category, chunk_id):
+    path = chunk_file_path(output_path, "coh", category, chunk_id)
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
+
+
+def load_loop_chunk(output_path, long_baseline, short_baseline, chunk_id):
+    path = chunk_file_path(output_path, "loops", long_baseline, chunk_id, short_baseline=short_baseline)
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
+
+
+def load_chunk_global_a_values(output_path, chunk_id, fallback_a1, fallback_a2):
+    """
+    Prefer cleaned chunkwise global values, then raw chunkwise global values, then config fallback.
+    """
+    a1 = fallback_a1
+    a2 = fallback_a2
+
+    path_clean = chunk_file_path(output_path, "an_global_clean", None, chunk_id)
+    path_raw = chunk_file_path(output_path, "an_global", None, chunk_id)
+
+    payload = None
+    if os.path.exists(path_clean):
+        payload = load_pickle(path_clean)
+    elif os.path.exists(path_raw):
+        payload = load_pickle(path_raw)
+
+    if payload is not None and "values" in payload:
+        vals = payload["values"]
+        if "a1" in vals and "regression" in vals["a1"] and np.isfinite(vals["a1"]["regression"]):
+            a1 = float(vals["a1"]["regression"])
+        if "a2" in vals and "regression" in vals["a2"] and np.isfinite(vals["a2"]["regression"]):
+            a2 = float(vals["a2"]["regression"])
+
+    return a1, a2
+
+
+def load_chunk_pixel_a_maps(output_path, chunk_id, frame_shape, fallback_a1, fallback_a2):
+    """
+    Loads chunkwise pixel maps from Data/an_chunks/pixel_maps/chunk_*.pkl
+    Falls back to scalar values if maps or NaNs are missing.
+    """
+    path = chunk_file_path(output_path, "an_pixel", None, chunk_id)
+
+    # first get chunkwise global fallback if available
+    global_fallback_a1, global_fallback_a2 = load_chunk_global_a_values(
+        output_path, chunk_id, fallback_a1, fallback_a2
+    )
+
+    if not os.path.exists(path):
+        a1_map = np.full(frame_shape, global_fallback_a1, dtype=np.float32)
+        a2_map = np.full(frame_shape, global_fallback_a2, dtype=np.float32)
+        return a1_map, a2_map
+
+    payload = load_pickle(path)
+    maps = payload.get("maps", payload)
+
+    if "a1" in maps:
+        a1_map = np.array(maps["a1"], dtype=np.float32)
     else:
-        none_indices18.append(i)
+        a1_map = np.full(frame_shape, global_fallback_a1, dtype=np.float32)
 
-loop_12_orig = np.array(loop_12_orig)
-loop_18_orig = np.array(loop_18_orig)
+    if "a2" in maps:
+        a2_map = np.array(maps["a2"], dtype=np.float32)
+    else:
+        a2_map = np.full(frame_shape, global_fallback_a2, dtype=np.float32)
 
+    if a1_map.shape != frame_shape or a2_map.shape != frame_shape:
+        raise ValueError(
+            f"Shape mismatch in pixel-wise a maps for chunk {chunk_id}. "
+            f"Expected {frame_shape}, got a1 {a1_map.shape}, a2 {a2_map.shape}."
+        )
 
-### removing noisy loops
-print(
-    "Masking noisy loop closures using circular moving average and standard deviaiton of the loop closures in time:"
-)
+    a1_map = np.where(np.isnan(a1_map), global_fallback_a1, a1_map)
+    a2_map = np.where(np.isnan(a2_map), global_fallback_a2, a2_map)
 
-# using circular_mean to calculate the mean phase value using complex numbers, and von_mises_variance to calculate the second moment of the Von Mises distribution
-_, thresh_loop12 = circular_mean_and_variance_over_epochs(loop_12_orig, axis=0)
-_, thresh_loop18 = circular_mean_and_variance_over_epochs(loop_18_orig, axis=0)
-
-
-#  Add a new axis at the beginning (axis=0) of these arrays to have shape (1, ...)
-# These are the threshold vlaues obtained for each pixel that will be used for masking later
-thresh_loop12 = np.expand_dims(thresh_loop12, axis=0)
-thresh_loop18 = np.expand_dims(thresh_loop18, axis=0)
+    return a1_map, a2_map
 
 
-# calculate a temporal moving average for wrapped data
-def moving_average(arr, window_size):
-    # Initialize an empty array to store the temporal averages
-    moving_averages = np.zeros_like(arr)
+# ======================================================================================
+# Preprocessing helpers
+# ======================================================================================
+
+def coherence_mask_loops(loop_arr, long_coh, base_coh, n_base, coh_thresh):
+    total_pixels = 0
+    masked_pixels = 0
+
+    for i, arr in enumerate(loop_arr):
+        if arr is None:
+            continue
+
+        long_coh_i = long_coh[i]
+        if long_coh_i is None:
+            continue
+
+        contributing = []
+        valid = True
+        for j in range(n_base):
+            idx = i + j
+            if idx >= len(base_coh) or base_coh[idx] is None:
+                valid = False
+                break
+            contributing.append(base_coh[idx])
+
+        if not valid:
+            continue
+
+        mask = long_coh_i < coh_thresh
+        for c in contributing:
+            mask |= c < coh_thresh
+
+        total_pixels += mask.size
+        masked_pixels += np.count_nonzero(mask)
+
+        loop_arr[i] = np.where(mask, np.nan, arr)
+
+    pct = (100.0 * masked_pixels / total_pixels) if total_pixels > 0 else np.nan
+    return loop_arr, pct
+
+
+def object_array_to_dense_with_none_indices(arr_obj):
+    dense = []
+    none_indices = []
+
+    for i, arr in enumerate(arr_obj):
+        if arr is None:
+            none_indices.append(i)
+        else:
+            dense.append(arr)
+
+    if len(dense) == 0:
+        raise ValueError("No valid loop closures found after preprocessing.")
+
+    return np.array(dense, dtype=np.float32), none_indices
+
+
+def restore_none_structure(dense_arr, none_indices, total_length):
+    restored = []
+    dense_idx = 0
+    none_set = set(none_indices)
+
+    for i in range(total_length):
+        if i in none_set:
+            restored.append(None)
+        else:
+            restored.append(dense_arr[dense_idx])
+            dense_idx += 1
+
+    return np.array(restored, dtype=object)
+
+
+def circular_moving_average(arr, window_size):
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+
     half_window = window_size // 2
-    ### miroring data at both ends for window_size/2 at each end
-    mirrored_shape = (arr.shape[0] + window_size, arr.shape[1], arr.shape[2])
+    moving_averages = np.zeros_like(arr, dtype=np.float32)
 
-    # Create an empty array to hold the mirrored data
+    mirrored_shape = (arr.shape[0] + window_size, arr.shape[1], arr.shape[2])
     mirrored_arr = np.empty(mirrored_shape, dtype=arr.dtype)
 
-    # Fill the mirrored array with the original data
-    mirrored_arr[window_size // 2 : -window_size // 2] = arr
+    mirrored_arr[half_window:-half_window] = arr
 
-    # Mirror the data at the beginning
-    for i in range(window_size // 2):
-#        mirrored_arr[i] = arr[window_size // 2 - i]
-        mirrored_arr[i] = arr[min(half_window - i, arr.shape[0] - 1)] 
+    for i in range(half_window):
+        mirrored_arr[i] = arr[min(half_window - i, arr.shape[0] - 1)]
 
-    # Mirror the data at the end
-    for i in range(window_size // 2):
-#        mirrored_arr[-(i + 1)] = arr[-(i + 1) - window_size // 2]
-        mirrored_arr[-(i + 1)] = arr[max(-1 - (half_window - i), 0)]
-    ####
+    for i in range(half_window):
+        mirrored_arr[-(i + 1)] = arr[max(-1 - (half_window - i), -arr.shape[0])]
 
-    # Calculate temporal averages within each window
     for t in range(half_window, mirrored_arr.shape[0] - half_window):
-        moving_averages[t - half_window, :, :] = np.angle(
+        moving_averages[t - half_window] = np.angle(
             np.nanmean(
-                np.exp(1j * (mirrored_arr[t - half_window : t + half_window, :, :])),
+                np.exp(1j * mirrored_arr[t - half_window:t + half_window]),
                 axis=0,
             )
         )
+
     return moving_averages
 
 
-# for loop 12
-# Calculate distance between each epoch and the moving average for each pixel
-print(
-    f"Calculating the moving average for {2 * interval} loop closures, followed by masking noisy loop closures..."
-)
-print(
-    "This may take a while, as it depends on the number of loops and the size of your dataset.\n"
-)
+def mask_noisy_loops(loop_dense, label, window_size=30, sigma_factor=2.0):
+    _, circular_var = circular_mean_and_variance_over_epochs(loop_dense, axis=0)
+    thresh = np.expand_dims(circular_var, axis=0)
 
-window_size = 30
+    moving_avg = circular_moving_average(loop_dense, window_size)
+    distances = np.abs(np.angle(np.exp(1j * (loop_dense - moving_avg))))
+    mask = distances > sigma_factor * thresh
 
-moving_avg = moving_average(loop_12_orig, window_size)
-distances = np.abs(np.angle(np.exp(1j * (loop_12_orig - moving_avg))))
-mask = distances > 2 * thresh_loop12  # it is 4*sigma
+    loop_dense_masked = np.where(mask, np.nan, loop_dense)
 
-# Replace values with NaN where mask is True
-loop_12_bk = loop_12_orig
-loop_12_orig = np.where(mask, np.nan, loop_12_orig)
-loop_12 = loop_12_orig.tolist()
+    total = np.prod(mask.shape)
+    n_masked = np.count_nonzero(mask)
+    pct = 100.0 * n_masked / total if total > 0 else np.nan
 
-for idx in none_indices12:
-    loop_12.insert(idx, None)
-loop_12 = np.array(loop_12, dtype=object)
-
-# for loop 18
-# Calculate distance between each epoch and the moving average for each pixel
-print(
-    f"Calculating the moving average for {3 * interval} loop closures, followed by masking noisy loop closures..."
-)
-print(
-    "This may take a while, as it depends on the number of loops and the size of your dataset.\n"
-)
-
-moving_avg = moving_average(loop_18_orig, window_size)
-distances = np.abs(np.angle(np.exp(1j * (loop_18_orig - moving_avg))))
-mask = distances > 2 * thresh_loop18  # it is 4*sigma
-
-# Replace values with NaN where mask is True
-loop_18_bk = loop_18_orig
-loop_18_orig = np.where(mask, np.nan, loop_18_orig)
-loop_18 = loop_18_orig.tolist()
-
-for idx in none_indices18:
-    loop_18.insert(idx, None)
-loop_18 = np.array(loop_18, dtype=object)
-
-print("Masking of noisy loop closures is completed.")
-
-#   ################ Apply coherece thresholding
-#    print('shape loop_12 = ', np.shape(loop_12))
-#    print('shape loop_12_orig = ', np.shape(loop_12_orig))
-#    print('shape coh_12 = ', np.shape(coh_12))
-#    for i, arr in enumerate(loop_12):
-#        if arr is not None:
-#            (frame_row, frame_col) = np.shape(arr)
-#            loop_12[i] = np.where((coh_12[i] > coh_thresh), arr, np.nan)
-#
-#
-#    for i, arr in enumerate(loop_18):
-#        if arr is not None:
-#            loop_18[i] = np.where((coh_18[i] > coh_thresh), arr, np.nan)
-#
-#
-#
-
-len12 = len(loop_12)  # number of 12 day loops including None
-len18 = len(loop_18)  # number of 18 day loops including None
-
-######################## Forming the design matrix A ##############################
-####################################################################################
-
-print("Preparing the design matrix and observation vector for the inversion step...")
-
-b = []
-A = []
-n_unk = (
-    len12 + 1
-)  # this in an initial value(i.e. the num of 6 biases). will be changed by the actual number of unk after considering the None values/missing
-# print('n_unk = ', n_unk)
-
-row = np.zeros(
-    n_unk, dtype=np.float32
-)  # each row of the design matrix A for the 12-day
-for i in range(len12):
-    b.append(loop_12[i])
-    # print('np.shape(loop_12[i] = ', np.shape(loop_12[i]))
-    row[i : i + 2] = a1 - 1
-    A.append(row)
-    row = np.zeros(n_unk, dtype=np.float32)
-
-row = np.zeros(
-    n_unk, dtype=np.float32
-)  # each row of the design matrix A for the 18-day
-for i in range(len18):
-    b.append(loop_18[i])
-    row[i : i + 3] = a2 - 1
-    A.append(row)
-    row = np.zeros(n_unk, dtype=np.float32)
-
-A = np.array(A)
-b = np.array(b, dtype=object)
+    return loop_dense_masked, pct
 
 
-####################### removing the rows from b and A where b is None
-mask = []
-mask = np.array([arr is not None for arr in b])
-# Convert the boolean mask to an integer mask
-mask = np.nonzero(mask)
-
-A = A[mask]  # Filter rows of A based on the mask
-b = b[mask]
-
-b = b.tolist()
-
-############  removing the columns of A where are values are zero (these are the unkonws which doesn't fall in any equations nor 12 neither 18 and thus cannot be corrected)
-
-# Find the column indices where all values are zero
-zero_columns = np.all(A == 0, axis=0)
-
-## Get the indices of the zero columns
-zero_column_indices = np.where(zero_columns)[0]
-
-# Get the indices of the non-zero columns
-non_zero_column_indices = np.where(~zero_columns)[
-    0
-]  # the indices of the unknowns that can be corrected
-
-# Save the file
-directory_path = os.path.join(output_path, "Data")
-file_path = os.path.join(directory_path, f"indices_unknown_tobe_corrected.npy")
-np.save(file_path, non_zero_column_indices)
+def build_observation_stack(loop_12_obj, loop_18_obj):
+    b = []
+    for arr in loop_12_obj:
+        b.append(arr)
+    for arr in loop_18_obj:
+        b.append(arr)
+    return np.array(b, dtype=object)
 
 
-### Adding all the existing 6-day ifgs indices to non_zero_column_indices. We want to use estimate their biases in the second step.
+def remove_none_rows(b):
+    valid_mask = np.array([arr is not None for arr in b])
+    b_valid = b[valid_mask]
+    return b_valid, valid_mask
 
 
-A_bk = A  # to keep a copy of A in case we want to esimate all 6-day biases with smoothing constraints
-b_bk = b
-all_column_indices = np.array(
-    range(A_bk.shape[1])
-)  # generating all indices in case we want to esimate all 6-day biases with smoothing constraints
+# ======================================================================================
+# Design matrices
+# ======================================================================================
 
-A = A[:, non_zero_column_indices]
+def build_global_design_matrix(len12, len18, a1, a2):
+    n_unk = len12 + 1
+    rows = []
 
-# finding the last column with value -1. this gives the number of 6-day biases that can be corrected
-last_column_with_minus_1 = None
+    for i in range(len12):
+        row = np.zeros(n_unk, dtype=np.float32)
+        row[i:i + 2] = a1 - 1.0
+        rows.append(row)
 
-# Iterate through the columns from right to left
-for col in range(len(A[0]) - 1, -1, -1):
-    if -1 in [row[col] for row in A]:
-        last_column_with_minus_1 = col
-        break
+    for i in range(len18):
+        row = np.zeros(n_unk, dtype=np.float32)
+        row[i:i + 3] = a2 - 1.0
+        rows.append(row)
 
-num_rows_before_temporals = A.shape[0]
+    return np.array(rows, dtype=np.float32)
 
-################################# Least Square inversion ###############################
-########################################################################################
-# First Inversion: Without Temporal Smoothing Constraints
-print("Starting the first inversion (without temporal smoothing constraints).")
-print(
-    "This step estimates the bias terms that can be corrected based on observed loop closures."
-)
 
-damp_factor = 0
+def build_pixelwise_design_matrix(len12, len18, a1_pix, a2_pix):
+    n_unk = len12 + 1
+    rows = []
 
-if apply_to_all == "no":  # this is without using any temporal constraints
+    for i in range(len12):
+        row = np.zeros(n_unk, dtype=np.float32)
+        row[i:i + 2] = a1_pix - 1.0
+        rows.append(row)
 
-    X1 = np.zeros((np.shape(A_bk)[1], frame_row, frame_col), dtype=np.float32)
-    # X1[:,:,:] = np.nan # after checking noticed this doesn't have any effect on the final vel
-    b_bk = np.array(b_bk)
+    for i in range(len18):
+        row = np.zeros(n_unk, dtype=np.float32)
+        row[i:i + 3] = a2_pix - 1.0
+        rows.append(row)
 
-    total_pixels = frame_row * frame_col  # Total number of pixels for progress bar
-    processed_pixels = 0  # Counter for processed pixels
-    print("Progress: [", end="", flush=True)
+    return np.array(rows, dtype=np.float32)
+
+
+def add_temporal_constraints_dense(A, n_unk, w):
+    temporal_rows = []
+    for i in range(n_unk - 2):
+        row = np.zeros(n_unk, dtype=np.float32)
+        row[i] = -w
+        row[i + 1] = 2.0 * w
+        row[i + 2] = -w
+        temporal_rows.append(row)
+
+    if len(temporal_rows) == 0:
+        A_temporal = np.zeros((0, n_unk), dtype=np.float32)
+    else:
+        A_temporal = np.array(temporal_rows, dtype=np.float32)
+
+    A_full = np.vstack((A, A_temporal))
+    n_temporal = A_temporal.shape[0]
+    return A_full, n_temporal
+
+
+# ======================================================================================
+# Inversion kernels
+# ======================================================================================
+
+def invert_with_global_a(
+    b_obs,
+    valid_mask_rows,
+    len12,
+    len18,
+    a1,
+    a2,
+    frame_row,
+    frame_col,
+    w,
+    min_num_eq=10,
+    damp=0.0,
+):
+    n_unk = len12 + 1
+    X = np.full((n_unk, frame_row, frame_col), np.nan, dtype=np.float32)
+
+    A_all = build_global_design_matrix(len12, len18, a1, a2)
+    A_obs = A_all[valid_mask_rows, :]
+    A_with_temporal, n_temporal = add_temporal_constraints_dense(A_obs, n_unk, w)
+    A_temporal = A_with_temporal[A_obs.shape[0]:, :]
+
+    total_misfit = 0.0
+    total_equations = 0
 
     for row in range(frame_row):
         for col in range(frame_col):
-            processed_pixels += 1
-            # Update progress bar
-            percentage = (processed_pixels / total_pixels) * 100
-            if processed_pixels % (total_pixels // 100) == 0:  # Update every 1%
-                print(f"{int(percentage)}%", end="", flush=True)
-                sys.stdout.write(
-                    "\rProgress: ["
-                    + "=" * (int(percentage) // 2)
-                    + " " * (50 - int(percentage) // 2)
-                    + "]"
-                )
+            bb_obs = b_obs[:, row, col]
+            non_nan_mask = ~np.isnan(bb_obs)
 
-            non_nan_mask = ~np.isnan(b_bk[:, row, col])
-            bb = b_bk[non_nan_mask, row, col]  # Remove NaN values
-            AA = A_bk[non_nan_mask, :]  # Remove corresponding rows
-            if len(bb) > min_num_eq:  # what is the min number of equation?
+            bb = bb_obs[non_nan_mask]
+            AA_obs = A_obs[non_nan_mask, :]
 
+            if len(bb) <= min_num_eq:
+                continue
+
+            bb_temporal = np.zeros(n_temporal, dtype=np.float32)
+            AA = np.vstack((AA_obs, A_temporal))
+            bb_full = np.concatenate((bb, bb_temporal))
+
+            if len(bb_full) > max(min_num_eq, n_temporal):
                 x, istop, itn, normr, normr2 = lsqr(
-                    csc_array(AA), bb, damp=damp_factor
-                )[
-                    :5
-                ]  # Using sparse matrix representation scipy.sparse.linalg
-                X1[:, row, col] = x
+                    csc_array(AA), bb_full, damp=damp
+                )[:5]
+
+                X[:, row, col] = x.astype(np.float32)
+                total_misfit += normr ** 2
+                total_equations += len(bb_full)
+
+    rms_residual = np.sqrt(total_misfit / total_equations) if total_equations > 0 else np.nan
+    return X, rms_residual
 
 
-#    if with_temporals == "no": # this solution will be the final answer to be saved as X
-#        # Fill X with values from X1 according to non_zero_column_indices
-#        for i, idx in enumerate(non_zero_column_indices):
-#            X[idx, :, :] = X1[i, :, :]
+def invert_pixelwise_with_pixel_a(
+    b_obs,
+    valid_mask_rows,
+    len12,
+    len18,
+    a1_map,
+    a2_map,
+    frame_row,
+    frame_col,
+    w,
+    min_num_eq=10,
+    damp=0.0,
+):
+    n_unk = len12 + 1
+    X = np.full((n_unk, frame_row, frame_col), np.nan, dtype=np.float32)
+
+    total_misfit = 0.0
+    total_equations = 0
+
+    for row in range(frame_row):
+        for col in range(frame_col):
+            a1_pix = a1_map[row, col]
+            a2_pix = a2_map[row, col]
+
+            if np.isnan(a1_pix) or np.isnan(a2_pix):
+                continue
+
+            A_local_all = build_pixelwise_design_matrix(len12, len18, a1_pix, a2_pix)
+            A_local_obs = A_local_all[valid_mask_rows, :]
+
+            A_with_temporal, n_temporal = add_temporal_constraints_dense(A_local_obs, n_unk, w)
+
+            bb_obs = b_obs[:, row, col]
+            non_nan_mask = ~np.isnan(bb_obs)
+
+            bb = bb_obs[non_nan_mask]
+            AA_obs = A_local_obs[non_nan_mask, :]
+
+            if len(bb) <= min_num_eq:
+                continue
+
+            A_temporal = A_with_temporal[A_local_obs.shape[0]:, :]
+            bb_temporal = np.zeros(n_temporal, dtype=np.float32)
+
+            AA = np.vstack((AA_obs, A_temporal))
+            bb_full = np.concatenate((bb, bb_temporal))
+
+            if len(bb_full) > max(min_num_eq, n_temporal):
+                x, istop, itn, normr, normr2 = lsqr(
+                    csc_array(AA), bb_full, damp=damp
+                )[:5]
+
+                X[:, row, col] = x.astype(np.float32)
+                total_misfit += normr ** 2
+                total_equations += len(bb_full)
+
+    rms_residual = np.sqrt(total_misfit / total_equations) if total_equations > 0 else np.nan
+    return X, rms_residual
 
 
+# ======================================================================================
+# Per-chunk worker
+# ======================================================================================
 
+def process_one_chunk(chunk_id, params, args_dict):
+    output_path = params["output_path"]
+    interval = params["interval"]
+    an_mode = params["estimate_an_mode"]
 
-print("\nFirst inversion (without temporal smoothing constraints) completed.")
+    config_a1, config_a2 = get_config_a_values(params)
 
-###########################
-# Second Inversion: With Temporal Smoothing Constraints
-print("Starting the second inversion (with temporal smoothing constraints).")
-print(
-    "This step estimates all bias terms, including those that cannot be corrected, using temporal smoothing constraints."
-)
+    cr, cc = chunk_id
 
-if with_temporals == "yes":  # This is using the temporal constranints on all unknowns
-    X2 = np.zeros((np.shape(A_bk)[1], frame_row, frame_col), dtype=np.float32)
-    # X2[:,:,:] = np.nan # after checking noticed this doesn't have any effect on the final vel
-    b_bk = np.array(b_bk)
+    # required chunks
+    loop_12_payload = load_loop_chunk(output_path, 2 * interval, interval, chunk_id)
+    loop_18_payload = load_loop_chunk(output_path, 3 * interval, interval, chunk_id)
 
-    #### Adding temporal constraints
-    row = np.zeros(
-        A_bk.shape[1], dtype=np.float32
-    )  # additional rows the design matrix A for temporal constraints, setting that to zero again
-    for i in range(len(all_column_indices) - 2):  # for all unknowns
-        row[i] = -1 * w
-        row[i + 1] = 2 * w
-        row[i + 2] = -1 * w
-        A_bk = np.vstack((A_bk, row))
-        row = np.zeros(
-            A_bk.shape[1], dtype=np.float32
-        )  # additional rows the design matrix A for temporal constraints, setting that to zero again
-    num_temporals = len(A_bk) - len(b_bk)
-    # print('num_temporals is ', num_temporals)
+    coh_6_payload = load_coh_chunk(output_path, interval, chunk_id)
+    coh_12_payload = load_coh_chunk(output_path, 2 * interval, chunk_id)
+    coh_18_payload = load_coh_chunk(output_path, 3 * interval, chunk_id)
 
-    ######### Appending zeroes to b according to the added number of temporal constraints obtained by np.shape(A)[0] - np.shape(b)[0]
-    b_0 = np.zeros(
-        (np.shape(A_bk)[0] - np.shape(b)[0], frame_row, frame_col), dtype=np.float32
+    if any(x is None for x in [loop_12_payload, loop_18_payload, coh_6_payload, coh_12_payload, coh_18_payload]):
+        return {
+            "chunk_id": chunk_id,
+            "status": "skipped",
+            "reason": "missing required loop/coherence chunk files",
+        }
+
+    loop_12 = np.array(loop_12_payload["data"], dtype=object)
+    loop_18 = np.array(loop_18_payload["data"], dtype=object)
+
+    coh_6 = np.array(coh_6_payload["data"], dtype=object)
+    coh_12 = np.array(coh_12_payload["data"], dtype=object)
+    coh_18 = np.array(coh_18_payload["data"], dtype=object)
+
+    frame_row, frame_col = None, None
+    for arr in loop_12:
+        if arr is not None:
+            frame_row, frame_col = arr.shape
+            break
+    if frame_row is None:
+        for arr in loop_18:
+            if arr is not None:
+                frame_row, frame_col = arr.shape
+                break
+    if frame_row is None:
+        return {
+            "chunk_id": chunk_id,
+            "status": "skipped",
+            "reason": "could not determine chunk shape from loop closures",
+        }
+
+    # coherence mask
+    coh_mask_stats = {}
+    if args_dict["coh_thresh"] > 0:
+        loop_12, pct12 = coherence_mask_loops(
+            loop_12, coh_12, coh_6, n_base=2, coh_thresh=args_dict["coh_thresh"]
+        )
+        loop_18, pct18 = coherence_mask_loops(
+            loop_18, coh_18, coh_6, n_base=3, coh_thresh=args_dict["coh_thresh"]
+        )
+        coh_mask_stats["loop12_pct"] = pct12
+        coh_mask_stats["loop18_pct"] = pct18
+    else:
+        coh_mask_stats["loop12_pct"] = np.nan
+        coh_mask_stats["loop18_pct"] = np.nan
+
+    # remove None for noisy-loop masking
+    loop_12_dense, none_indices12 = object_array_to_dense_with_none_indices(loop_12)
+    loop_18_dense, none_indices18 = object_array_to_dense_with_none_indices(loop_18)
+
+    loop_12_dense, noisy12_pct = mask_noisy_loops(
+        loop_12_dense,
+        label=f"{2 * interval}-day",
+        window_size=args_dict["window_size"],
+        sigma_factor=2.0,
     )
-    b_bk = np.vstack((b_bk, b_0))
+    loop_18_dense, noisy18_pct = mask_noisy_loops(
+        loop_18_dense,
+        label=f"{3 * interval}-day",
+        window_size=args_dict["window_size"],
+        sigma_factor=2.0,
+    )
 
-    thresh_n_eq = num_temporals  # in case of using temporals, we don't want the nan pixels with zero equations with only using temporals
+    loop_12_obj = restore_none_structure(loop_12_dense, none_indices12, len(loop_12))
+    loop_18_obj = restore_none_structure(loop_18_dense, none_indices18, len(loop_18))
 
-    processed_pixels = 0  # Reset counter for second inversion
-    print("Progress: [", end="", flush=True)
+    len12 = len(loop_12_obj)
+    len18 = len(loop_18_obj)
 
-    for row in range(frame_row):
-        for col in range(frame_col):
-            processed_pixels += 1
-            # Update progress bar
-            percentage = (processed_pixels / total_pixels) * 100
-            if processed_pixels % (total_pixels // 100) == 0:  # Update every 1%
-                print(f"{int(percentage)}%", end="", flush=True)
-                sys.stdout.write(
-                    "\rProgress: ["
-                    + "=" * (int(percentage) // 2)
-                    + " " * (50 - int(percentage) // 2)
-                    + "]"
+    b = build_observation_stack(loop_12_obj, loop_18_obj)
+    b_valid, valid_mask_rows = remove_none_rows(b)
+    b_valid = np.array(b_valid.tolist(), dtype=np.float32)
+
+    if an_mode == "config":
+        X, rms_residual = invert_with_global_a(
+            b_obs=b_valid,
+            valid_mask_rows=valid_mask_rows,
+            len12=len12,
+            len18=len18,
+            a1=config_a1,
+            a2=config_a2,
+            frame_row=frame_row,
+            frame_col=frame_col,
+            w=args_dict["w"],
+            min_num_eq=args_dict["min_num_eq"],
+            damp=0.0,
+        )
+        a_source = {"mode": "config", "a1": config_a1, "a2": config_a2}
+
+    elif an_mode == "global":
+        global_a1, global_a2 = load_chunk_global_a_values(
+            output_path, chunk_id, config_a1, config_a2
+        )
+        X, rms_residual = invert_with_global_a(
+            b_obs=b_valid,
+            valid_mask_rows=valid_mask_rows,
+            len12=len12,
+            len18=len18,
+            a1=global_a1,
+            a2=global_a2,
+            frame_row=frame_row,
+            frame_col=frame_col,
+            w=args_dict["w"],
+            min_num_eq=args_dict["min_num_eq"],
+            damp=0.0,
+        )
+        a_source = {"mode": "global", "a1": global_a1, "a2": global_a2}
+
+    elif an_mode == "pixel":
+        a1_map, a2_map = load_chunk_pixel_a_maps(
+            output_path=output_path,
+            chunk_id=chunk_id,
+            frame_shape=(frame_row, frame_col),
+            fallback_a1=config_a1,
+            fallback_a2=config_a2,
+        )
+
+        X, rms_residual = invert_pixelwise_with_pixel_a(
+            b_obs=b_valid,
+            valid_mask_rows=valid_mask_rows,
+            len12=len12,
+            len18=len18,
+            a1_map=a1_map,
+            a2_map=a2_map,
+            frame_row=frame_row,
+            frame_col=frame_col,
+            w=args_dict["w"],
+            min_num_eq=args_dict["min_num_eq"],
+            damp=0.0,
+        )
+        a_source = {
+            "mode": "pixel",
+            "a1_min": float(np.nanmin(a1_map)),
+            "a1_max": float(np.nanmax(a1_map)),
+            "a2_min": float(np.nanmin(a2_map)),
+            "a2_max": float(np.nanmax(a2_map)),
+        }
+
+    else:
+        return {
+            "chunk_id": chunk_id,
+            "status": "failed",
+            "reason": f"Unknown estimate_an_mode: {an_mode}",
+        }
+
+    # save chunk result
+    x_chunk_dir = os.path.join(output_path, "Data", "X_chunks")
+    x_chunk_file = os.path.join(x_chunk_dir, f"chunk_r{cr:03d}_c{cc:03d}.pkl")
+
+    payload = {
+        "chunk_id": chunk_id,
+        "row_range": loop_12_payload["row_range"],
+        "col_range": loop_12_payload["col_range"],
+        "valid_fraction": loop_12_payload["valid_fraction"],
+        "estimate_an_mode": an_mode,
+        "a_source": a_source,
+        "w": args_dict["w"],
+        "coh_thresh": args_dict["coh_thresh"],
+        "min_num_eq": args_dict["min_num_eq"],
+        "window_size": args_dict["window_size"],
+        "frame_shape": (frame_row, frame_col),
+        "X": X,
+        "rms_residual": rms_residual,
+        "coh_mask_stats": coh_mask_stats,
+        "noisy_loop_pct": {
+            "loop12_pct": noisy12_pct,
+            "loop18_pct": noisy18_pct,
+        },
+        "len12": len12,
+        "len18": len18,
+    }
+
+    save_pickle(x_chunk_file, payload)
+
+    # free some memory
+    del loop_12, loop_18, coh_6, coh_12, coh_18, b_valid, X
+    gc.collect()
+
+    return {
+        "chunk_id": chunk_id,
+        "status": "ok",
+        "x_chunk_file": x_chunk_file,
+        "rms_residual": rms_residual,
+        "valid_fraction": loop_12_payload["valid_fraction"],
+        "a_source": a_source,
+    }
+
+
+# ======================================================================================
+# Main
+# ======================================================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--w", type=float, default=0.1, help="Temporal smoothing weight.")
+    parser.add_argument("--window_size", type=int, default=30, help="Moving-average window size.")
+    parser.add_argument("--coh_thresh", type=float, default=0, help="Coherence threshold.")
+    parser.add_argument("--min_num_eq", type=int, default=10, help="Minimum equations per pixel.")
+    parser.add_argument("--n_workers", type=int, default=48, help="Number of parallel workers across chunks.")
+    args = parser.parse_args()
+
+    params = read_config()
+    output_path = params["output_path"]
+    an_mode = params["estimate_an_mode"]
+
+    config_a1, config_a2 = get_config_a_values(params)
+
+    print(f"estimate_an_mode = {an_mode}")
+    print(f"Config scalar values: a1={config_a1}, a2={config_a2}, w={args.w}")
+
+    chunk_index = load_chunk_index(output_path)
+    valid_chunks = chunk_index["valid_chunks"]
+
+    print(f"Number of valid chunks to process: {len(valid_chunks)}")
+    print(f"Running with n_workers = {args.n_workers}")
+
+    args_dict = {
+        "w": args.w,
+        "window_size": args.window_size,
+        "coh_thresh": args.coh_thresh,
+        "min_num_eq": args.min_num_eq,
+    }
+
+    results = []
+
+    if args.n_workers == 1:
+        for chunk_id in valid_chunks:
+            cr, cc = chunk_id
+            print(f"Processing chunk r{cr:03d}, c{cc:03d} ...")
+            res = process_one_chunk(chunk_id, params, args_dict)
+            results.append(res)
+    else:
+        with ProcessPoolExecutor(max_workers=args.n_workers) as ex:
+            futures = {
+                ex.submit(process_one_chunk, chunk_id, params, args_dict): chunk_id
+                for chunk_id in valid_chunks
+            }
+
+            completed = 0
+            total = len(futures)
+
+            for fut in as_completed(futures):
+                completed += 1
+                chunk_id = futures[fut]
+                cr, cc = chunk_id
+
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {
+                        "chunk_id": chunk_id,
+                        "status": "failed",
+                        "reason": str(e),
+                    }
+
+                results.append(res)
+
+                pct = 100.0 * completed / total
+                print(
+                    f"[{completed}/{total}] {pct:5.1f}% finished - chunk r{cr:03d}, c{cc:03d}: {res['status']}"
                 )
 
-            non_nan_mask = ~np.isnan(b_bk[:, row, col])
-            bb = b_bk[non_nan_mask, row, col]  # Remove NaN values
-            AA = A_bk[non_nan_mask, :]  # Remove corresponding rows
-            if len(bb) > thresh_n_eq:
+    # write summary index
+    x_chunk_dir = os.path.join(output_path, "Data", "X_chunks")
+    os.makedirs(x_chunk_dir, exist_ok=True)
 
-                x, istop, itn, normr, normr2 = lsqr(
-                    csc_array(AA), bb, damp=damp_factor
-                )[
-                    :5
-                ]  # Using sparse matrix representation scipy.sparse.linalg
-                X2[:, row, col] = x
+    ok_results = [r for r in results if r["status"] == "ok"]
+    failed_results = [r for r in results if r["status"] != "ok"]
 
-    print("\nSecond inversion (with temporal smoothing constraints) completed.")
+    rms_vals = [r["rms_residual"] for r in ok_results if np.isfinite(r["rms_residual"])]
+    rms_mean = float(np.mean(rms_vals)) if len(rms_vals) > 0 else np.nan
 
-    ####### combining X1 and X2 into X
+    x_chunk_index = {
+        "estimate_an_mode": an_mode,
+        "w": args.w,
+        "window_size": args.window_size,
+        "coh_thresh": args.coh_thresh,
+        "min_num_eq": args.min_num_eq,
+        "n_workers": args.n_workers,
+        "n_total_chunks": len(valid_chunks),
+        "n_ok_chunks": len(ok_results),
+        "n_failed_chunks": len(failed_results),
+        "mean_rms_residual": rms_mean,
+        "results": results,
+    }
 
-    X = np.zeros((np.shape(A_bk)[1], frame_row, frame_col), dtype=np.float32)
-    X[:, :, :] = np.nan
+    x_chunk_index_file = os.path.join(x_chunk_dir, "x_chunk_index.pkl")
+    save_pickle(x_chunk_index_file, x_chunk_index)
 
-    # Fill X with values from X1 according to non_zero_column_indices
-    for i, idx in enumerate(non_zero_column_indices):
-        X[idx, :, :] = X1[i, :, :]
+    print("\nChunked inversion completed.")
+    print(f"Successful chunks: {len(ok_results)}")
+    print(f"Failed/skipped chunks: {len(failed_results)}")
+    print(f"Mean RMS residual over successful chunks: {rms_mean:.6f}" if np.isfinite(rms_mean) else "Mean RMS residual: nan")
+    print(f"Saved chunk summary to: {x_chunk_index_file}")
 
-    # Fill in the missing values from X2
-    for i, idx in enumerate(all_column_indices):
-        if idx not in non_zero_column_indices:
-            X[idx, :, :] = X2[i, :, :]
 
-    # Ensure the dtype is appropriate for your data
-    X = X.astype(np.float32)
-
-directory_path = os.path.join(output_path, "Data")
-file_path = os.path.join(directory_path, f"X_base_ifgs_biases.npy")
-np.save(file_path, X)
-
-print("Inversion process completed. Results saved to:", file_path)
-
-##########################################################################################################
+if __name__ == "__main__":
+    main()

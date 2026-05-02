@@ -1,424 +1,923 @@
 #!/usr/bin/env python3
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-import pickle
 import os
-import sys
-import glob
+import pickle
 import configparser
 import warnings
 
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore", category=np.VisibleDeprecationWarning)
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import generic_filter
 
-################################################################################
+warnings.filterwarnings("ignore", category=np.exceptions.VisibleDeprecationWarning)
 
-HELP_TEXT = """
-PhaseBias_03_calibration_pars.py
+# ============================================================
+# 1️⃣ Load configuration
+# ============================================================
 
-This script estimates the calibration parameters a_n using the loop closures calculated in the previous step. 
-
-The calibration parameters a_n are estimated by calculating the ratio of the long-term loop closure for the interferogram of interest to the long-term loop closure for the base interferogram. Assuming negligible bias in long-term interferograms, a_n is calculated as follows:
-
-    a_n = |φ(i,i+l) - Σ(t=i to i+l)φ(t,t+1+n)|_2π / |φ(i,i+l) - Σ(t=i to i+l)φ(t,t+1)|_2π
-
-where:
-- φ(i,i+l) is a long-term interferogram connecting epoch i to i+l.
-- φ(t,t+1) represents the base interferogram.
-- φ(t,t+1+n) is the short interferogram to be corrected using a_n.
-
-### Input:
-1. Loop closures from the previous step (e.g., 216-6, 216-12, and 216-18 for 6-day acquisition intervals).
-2. The long-term interferogram length (e.g., 216 days) must be specified at the beginning.
-3. The number of a_n parameters to estimate, specified using `num_a`. For example:
-   - Setting `num_a=2` indicates that a1 and a2 will be estimated (used to correct 12- and 18-day interferograms).
-   - For correcting longer interferograms, `num_a` should be set accordingly.
-
-### Output:
-1. All possible a_n values are calculated.
-2. Visualizations:
-   - Example plots of a_n arrays and their corresponding histograms, illustrating spatial variations.
-   - Time-series plots showing how a_n values evolve over time.
-3. Mean a_n values over time are output for further use.
-
-### File Outputs:
-- Results are stored in the output directory defined in the `config.txt` file under `/Data/` as `Mean_an_values.pkl`.
-
-### Additional Notes:
-- Users should ensure that `num_a` aligns with the desired temporal baselines for correction.
-
-"""
-if "--help" in sys.argv:
-    print(HELP_TEXT)
-    sys.exit(0)
-
-
-###############################################################################
-# Config file path
 config_file = "config.txt"
-
-# Check if config file exists
 if not os.path.exists(config_file):
-    raise FileNotFoundError(
-        f"Error: The configuration file '{config_file}' was not found in the script's directory."
-    )
+    raise FileNotFoundError("config.txt not found.")
 
-# Initialize the configparser
 config = configparser.ConfigParser()
-
-
-# Read the config.txt file
 config.read(config_file)
 
-# Define required parameters
-required_parameters = [
-    "root_path",
-    "frame",
-    "start",
-    "end",
-    "interval",
-    "nlook",
-    "LiCSAR_data",
-]
+output_path = config.get("DEFAULT", "output_path")
+interval = config.getint("DEFAULT", "interval")
+num_a = config.getint("DEFAULT", "num_a")
+selected_baseline = config.getint("DEFAULT", "selected_baseline")
 
-# Initialize a dictionary to store parameters
-parameters = {}
+# fixed as requested
+coh_thresh = 20
 
-# Attempt to retrieve each parameter and catch errors
-try:
-    parameters["root_path"] = config.get("DEFAULT", "root_path")
-    parameters["output_path"] = config.get("DEFAULT", "output_path")
-    parameters["frame"] = config.get("DEFAULT", "frame")
-    parameters["start"] = config.get("DEFAULT", "start")
-    parameters["end"] = config.get("DEFAULT", "end")
-    parameters["interval"] = config.getint("DEFAULT", "interval")
-    parameters["nlook"] = config.getint(
-        "DEFAULT", "nlook"
-    )  # Assuming 'nlook' should be an integer
-    parameters["num_a"] = config.getint("DEFAULT", "num_a")
-    parameters["LiCSAR_data"] = config.get("DEFAULT", "LiCSAR_data")
+# noisy-pixel removal parameters
+min_count_for_cleaning = config.getint("DEFAULT", "min_count_for_cleaning", fallback=1)
+local_window_size = config.getint("DEFAULT", "local_window_size", fallback=7)
+local_thresh = config.getfloat("DEFAULT", "local_thresh", fallback=3.0)
+min_mad = config.getfloat("DEFAULT", "min_mad", fallback=0.15)
 
-except configparser.NoOptionError as e:
-    # Error message if a required parameter is missing
-    missing_param = str(e).split(": ")[1]
+# optional plotting
+plot_chunk_results = config.getboolean("DEFAULT", "plot_an_chunks", fallback=False)
+plot_first_n_chunks = config.getint("DEFAULT", "plot_first_n_chunks", fallback=3)
+plot_global_chunk_maps = config.getboolean("DEFAULT", "plot_global_chunk_maps", fallback=True)
+save_global_chunk_maps = config.getboolean("DEFAULT", "save_global_chunk_maps", fallback=True)
+
+# robust regression parameters
+robust_sigma = config.getfloat("DEFAULT", "robust_sigma", fallback=3.0)
+robust_min_mad = config.getfloat("DEFAULT", "robust_min_mad", fallback=0.05)
+
+# ============================================================
+# 2️⃣ Paths and loading helpers
+# ============================================================
+
+data_dir = os.path.join(output_path, "Data")
+
+chunk_index_file = os.path.join(data_dir, "chunk_index.pkl")
+if not os.path.exists(chunk_index_file):
+    raise FileNotFoundError(f"Missing chunk index: {chunk_index_file}")
+
+with open(chunk_index_file, "rb") as f:
+    chunk_index = pickle.load(f)
+
+valid_chunks = chunk_index["valid_chunks"]
+available_coh_categories = sorted(chunk_index["categories_coh"])
+frame_shape = tuple(chunk_index["frame_shape"])
+chunk_defs = chunk_index["chunk_defs"]
+
+if selected_baseline not in available_coh_categories:
     raise ValueError(
-        f"Error: Required parameter '{missing_param}' is missing in '{config_file}'. Please check the file contents."
-    )
-except configparser.Error as e:
-    # General error for any configparser-related issues
-    raise ValueError(f"Error while reading '{config_file}': {e}")
-
-# Assign to individual variables for easy access
-root_path = parameters["root_path"]
-output_path = parameters["output_path"]
-frame = parameters["frame"]
-start = parameters["start"]
-end = parameters["end"]
-interval = parameters["interval"]
-nlook = parameters["nlook"]
-num_a = parameters["num_a"]
-LiCSAR_data = parameters["LiCSAR_data"]
-
-# hardcoded parameters, not included in the config file
-landmask = 1
-filtered_ifgs = "yes"
-max_loop = 5  # in case of 3 all loops with 6,12,18-day will be calculated (e.g. (60,6), (60,12) and (60,18))
-
-
-##################################################### Loop Closure calculation #####################################################
-####################################################################################################################################
-track = frame[0:3]
-if track[0] == "0":
-    track = track[1:3]
-if track[0] == "0":
-    track = track[1:2]
-
-
-###################### Read coh:
-print("\nReading all coherence data...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
-
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        coh = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
-print("Reading coherence data completed.")
-
-
-##################### Read Loops
-
-print("\nReading all loop closures...")
-filename_pattern = "All_loops_*"  # Pattern to match files starting with "All_ifgs"
-
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        all_loops = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
+        f"selected_baseline={selected_baseline} not found in available categories: {available_coh_categories}"
     )
 
-print("Reading loop closures completed.")
+
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-##################################################### Loop Closure calculation #####################################################
-####################################################################################################################################
+def save_pickle(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
 
 
-long_baseline = 216  # 36,72,108,144,180,216,252,288,324
-coh_thresh = 25
+def chunk_file_path(kind, category_or_name, chunk_id, short_baseline=None):
+    cr, cc = chunk_id
 
-
-def calc_an(loop_360_n, loop_360_6):
-    """
-    Calculates the a_n values from loop closures.
-
-    Parameters:
-        loop_360_n (ndarray): Array of loop closures for n-day intervals.
-        loop_360_6 (ndarray): Array of loop closures for 6-day intervals.
-
-    Returns:
-        ndarray: Mean a_n values for all loop closures.
-        list: List of all a_n arrays for further processing or plotting.
-    """
-    ratios = []
-
-    # Loop through indices
-    for i in range(len(loop_360_6)):
-        if loop_360_6[i] is not None and loop_360_n[i] is not None:
-            # Calculate the ratio for non-NaN elements
-            ratio_i = np.divide(
-                loop_360_n[i],
-                loop_360_6[i],
-                out=np.full_like(loop_360_n[i], np.nan),
-                where=~np.isnan(loop_360_6[i]),
-            )
-            ratios.append(ratio_i)
-
-# Check if `ratios` is empty before proceeding
-    if not ratios:
-        print("Warning: No valid a_n values could be calculated. Returning NaN values.")
-        return np.array([np.nan]), []
-
-
-    # Convert the list of ratios to a numpy array
-    an = np.array(ratios, dtype=object)
-    mean_an_long_baseline = []
-
-    # Calculate mean values of each a_n
-    for arr in an:
-        mask = (arr > 0) & (arr < 1)  # Apply mask to filter invalid values
-        arr[~mask] = np.nan
-        if not np.isnan(arr).all():  # Check if all elements are NaN
-            mean_an = np.nanmean(arr)
-        else:
-            mean_an = np.nan  # Assign NaN for completely empty slices
-
-        mean_an_long_baseline.append(mean_an)
-
-    return np.array(mean_an_long_baseline), an
-
-
-##################################################################################
-############################
-def plot_an(an_arrays, mean_a_long_baseline, k):
-    """
-    Plots the a_n arrays with the largest coverage and their histograms in a two-row layout,
-    as well as the mean values of calibration parameters a_n over time.
-
-    Parameters:
-        an_arrays (list): List of a_n arrays.
-        mean_a_long_baseline (ndarray): Array of mean calibration parameter values for a_1, a_2, ..., a_n.
-        k (int): The current value of k (e.g., 2 for a1, 3 for a2).
-    """
-
-    # Calculate the coverage (number of non-NaN values) for each array
-    coverage = []
-    valid_an_arrays = []  # Store only valid arrays for plotting
-
-    for arr in an_arrays:
-        if (
-            arr is not None and arr.ndim == 2 and not np.all(np.isnan(arr))
-        ):  # Check for valid 2D arrays
-            coverage.append(np.sum(~np.isnan(arr)))  # Count non-NaN values
-            valid_an_arrays.append(arr)
-
-    # Sort arrays by coverage in descending order
-    sorted_indices = np.argsort(coverage)[::-1]
-    selected_arrays = [
-        valid_an_arrays[idx] for idx in sorted_indices[:6]
-    ]  # Select top 6 arrays
-
-    # Plot the a_n arrays and their histograms in a two-row layout
-    if selected_arrays:
-        num_arrays = len(selected_arrays)
-        fig = plt.figure(figsize=(4 * num_arrays, 8))
-        gs = GridSpec(
-            2, num_arrays + 1, width_ratios=[1] * num_arrays + [0.1]
-        )  # Add space for colorbar
-
-        # Plot selected arrays
-        axes_img = []
-        for i, arr in enumerate(selected_arrays):
-            ax_img = fig.add_subplot(gs[0, i])
-            im = ax_img.imshow(arr, cmap="RdYlBu", vmin=-0.8, vmax=0.8)
-            ax_img.set_title(f"{i+1}th $a_{{{k-1}}}$ Array")  # Dynamically set title
-            ax_img.axis("off")
-            axes_img.append(ax_img)
-
-        # Add a single colorbar for all array plots
-        cbar_ax = fig.add_subplot(gs[0, -1])
-        fig.colorbar(im, cax=cbar_ax, orientation="vertical", label="Color Scale")
-
-        # Plot histograms for the selected arrays
-        for i, arr in enumerate(selected_arrays):
-            ax_hist = fig.add_subplot(gs[1, i])
-            ax_hist.hist(arr.flatten(), bins=100, color="blue", alpha=0.7, density=True)
-            ax_hist.set_title(
-                f"{i+1}th $a_{{{k-1}}}$ Histogram"
-            )  # Dynamically set title
-            ax_hist.set_xlim([-3, 3])  # Adjust histogram range as needed
-
-        plt.tight_layout()
-        plt.show()
+    if kind == "coh":
+        return os.path.join(
+            data_dir, "coh", f"{category_or_name}d", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    elif kind == "loops":
+        return os.path.join(
+            data_dir,
+            "loops",
+            f"{category_or_name}_{short_baseline}",
+            f"chunk_r{cr:03d}_c{cc:03d}.pkl",
+        )
     else:
-        print("No valid a_n arrays available for plotting.")
-
-    # Plot the mean values of a_n over time
-    x_values = np.arange(len(mean_a_long_baseline))  # Sequential indices for x-axis
-    fig, ax = plt.subplots(figsize=(6, 4))
+        raise ValueError("Unknown kind")
 
 
-    # Filter out NaN values to avoid gaps in the plot
-    valid_indices = ~np.isnan(mean_a_long_baseline)  # Mask for valid (non-NaN) entries
-    x_valid = x_values[valid_indices]  # Only use valid time steps
-    y_valid = np.array(mean_a_long_baseline)[valid_indices]  # Only use valid a_n values
+def load_coh_chunk(category, chunk_id):
+    path = chunk_file_path("coh", category, chunk_id)
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
 
 
-    # Remove NaN values for trendline fitting
-    valid_indices = ~np.isnan(mean_a_long_baseline)  # Mask for valid (non-NaN) entries
-    if (
-        valid_indices.sum() > 1
-    ):  # Ensure there are at least two valid points for fitting
-#        x_valid = x_values[valid_indices]
-        y_valid = np.array(mean_a_long_baseline)[valid_indices]
-        x_valid = np.arange(len(y_valid))
+def load_loop_chunk(long_baseline, short_baseline, chunk_id):
+    path = chunk_file_path("loops", long_baseline, chunk_id, short_baseline=short_baseline)
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
 
-        # Fit and plot a trendline
-        coefficients = np.polyfit(x_valid, y_valid, 1)
-        trendline = np.polyval(coefficients, x_valid)
-        ax.plot(x_valid, trendline, color="red", label="Trendline")
 
-    # Scatter plot for all points (including NaN if any)
-    ax.scatter(
-        #x_values,
-        #mean_a_long_baseline,
-        x_valid,  # Only use valid time steps
-        y_valid,  # Only use valid a_n values
+# ============================================================
+# 3️⃣ Utility: determine which a_n are estimable
+# ============================================================
 
-        color="blue",
-        marker="o",
-        label="Mean Values",
-        s=9,
+def get_estimable_n_values(selected_baseline, interval, available_loop_products, available_coh_categories, max_n=None):
+    estimable_n = []
+
+    max_possible_n = selected_baseline // interval
+    if max_n is not None:
+        max_possible_n = min(max_possible_n, max_n)
+
+    for n in range(2, max_possible_n + 1):
+        short_len = n * interval
+
+        if short_len > selected_baseline:
+            break
+        if selected_baseline % short_len != 0:
+            break
+        if (selected_baseline, short_len) not in available_loop_products:
+            break
+        if short_len not in available_coh_categories:
+            break
+
+        estimable_n.append(n)
+
+    return estimable_n
+
+
+# ============================================================
+# 4️⃣ Loop masking using coherence
+# ============================================================
+
+def coherence_mask_loops_for_an(loop_arr, long_coh, short_coh, n_short, coh_thresh):
+    out = []
+
+    for i, arr in enumerate(loop_arr):
+        if not isinstance(arr, np.ndarray):
+            out.append(None)
+            continue
+
+        if i >= len(long_coh) or not isinstance(long_coh[i], np.ndarray):
+            out.append(None)
+            continue
+
+        valid = True
+        contributing = []
+
+        for j in range(n_short):
+            idx = i + j
+            if idx >= len(short_coh) or not isinstance(short_coh[idx], np.ndarray):
+                valid = False
+                break
+            contributing.append(short_coh[idx])
+
+        if not valid:
+            out.append(None)
+            continue
+
+        mask = long_coh[i] < coh_thresh
+        for c in contributing:
+            mask |= c < coh_thresh
+
+        out.append(np.where(mask, np.nan, arr))
+
+    return out
+
+
+# ============================================================
+# 5️⃣ Scalar/global estimation
+# ============================================================
+
+def calc_an(loop_n_list, loop_base_list):
+    sum_xy = 0.0
+    sum_x2 = 0.0
+    ratio_means = []
+
+    for x_arr, y_arr in zip(loop_base_list, loop_n_list):
+        if not isinstance(x_arr, np.ndarray) or not isinstance(y_arr, np.ndarray):
+            continue
+
+        x = x_arr.astype(float)
+        y = y_arr.astype(float)
+
+        valid = (~np.isnan(x)) & (~np.isnan(y)) & (x != 0)
+
+        if not np.any(valid):
+            continue
+
+        ratio = y[valid] / x[valid]
+        ratio_means.append(np.nanmean(ratio))
+
+        x_valid = x[valid]
+        y_valid = y[valid]
+
+        sum_xy += np.sum(x_valid * y_valid)
+        sum_x2 += np.sum(x_valid * x_valid)
+
+    regression_estimate = sum_xy / sum_x2 if sum_x2 > 0 else np.nan
+    ratio_mean = np.nanmean(ratio_means) if len(ratio_means) > 0 else np.nan
+    return ratio_mean, regression_estimate
+
+
+def robust_regression_two_pass(x_valid, y_valid, sigma=3.0, min_mad_local=0.05):
+    if x_valid.size == 0:
+        return np.nan, 0, 0
+
+    sum_x2 = np.sum(x_valid * x_valid)
+    if sum_x2 <= 0:
+        return np.nan, x_valid.size, 0
+
+    a0 = np.sum(x_valid * y_valid) / sum_x2
+    residuals = y_valid - a0 * x_valid
+
+    med_res = np.median(residuals)
+    mad_res = np.median(np.abs(residuals - med_res))
+    thresh = sigma * max(mad_res, min_mad_local)
+
+    keep = np.abs(residuals - med_res) <= thresh
+
+    x2 = x_valid[keep]
+    y2 = y_valid[keep]
+
+    if x2.size == 0:
+        return np.nan, x_valid.size, 0
+
+    sum_x2_2 = np.sum(x2 * x2)
+    if sum_x2_2 <= 0:
+        return np.nan, x_valid.size, x2.size
+
+    a1 = np.sum(x2 * y2) / sum_x2_2
+    return a1, x_valid.size, x2.size
+
+
+def calc_an_with_bad_pixel_mask(
+    loop_n_list,
+    loop_base_list,
+    bad_pixel_mask,
+    min_total_valid=0,
+    sigma=3.0,
+    min_mad_local=0.05,
+):
+    ratio_means = []
+    x_all = []
+    y_all = []
+    total_valid_count = 0
+
+    for x_arr, y_arr in zip(loop_base_list, loop_n_list):
+        if not isinstance(x_arr, np.ndarray) or not isinstance(y_arr, np.ndarray):
+            continue
+
+        x = x_arr.astype(float)
+        y = y_arr.astype(float)
+
+        valid = (~np.isnan(x)) & (~np.isnan(y)) & (x != 0) & (~bad_pixel_mask)
+
+        n_valid = np.count_nonzero(valid)
+        total_valid_count += n_valid
+
+        if n_valid == 0:
+            continue
+
+        ratio = y[valid] / x[valid]
+        ratio_means.append(np.nanmean(ratio))
+
+        x_all.append(x[valid])
+        y_all.append(y[valid])
+
+    if total_valid_count < min_total_valid or len(x_all) == 0:
+        return np.nan, np.nan, total_valid_count, 0
+
+    x_valid = np.concatenate(x_all)
+    y_valid = np.concatenate(y_all)
+
+    reg_clean, _, n_after_robust = robust_regression_two_pass(
+        x_valid, y_valid, sigma=sigma, min_mad_local=min_mad_local
     )
 
-    # Set labels and limits
-    ax.set_ylim(-3, 3)  # Adjust limits as needed
-    ax.set_xlabel("Time Step")  # Sequential index as x-axis
-    ax.set_ylabel("Mean Values", fontsize=12)
-    ax.legend()
+    ratio_mean = np.nanmean(ratio_means) if len(ratio_means) > 0 else np.nan
+    return ratio_mean, reg_clean, total_valid_count, n_after_robust
 
-    # Adjust layout and show the plot
+
+# ============================================================
+# 6️⃣ Pixel-wise regression
+# ============================================================
+
+def pixelwise_regression(loop_base_masked, loop_n_masked, min_abs_x=0.02):
+    sum_xy = None
+    sum_x2 = None
+    count_valid = None
+
+    for x_arr, y_arr in zip(loop_base_masked, loop_n_masked):
+        if not isinstance(x_arr, np.ndarray) or not isinstance(y_arr, np.ndarray):
+            continue
+
+        x = x_arr.astype(float)
+        y = y_arr.astype(float)
+
+        valid = (~np.isnan(x)) & (~np.isnan(y)) & (np.abs(x) > min_abs_x)
+
+        if sum_xy is None:
+            sum_xy = np.zeros_like(x, dtype=float)
+            sum_x2 = np.zeros_like(x, dtype=float)
+            count_valid = np.zeros_like(x, dtype=np.int32)
+
+        sum_xy[valid] += x[valid] * y[valid]
+        sum_x2[valid] += x[valid] * x[valid]
+        count_valid[valid] += 1
+
+    if sum_xy is None:
+        raise ValueError("No valid data found for pixelwise regression.")
+
+    a_map = np.full_like(sum_xy, np.nan, dtype=float)
+    valid_final = sum_x2 > 0
+    a_map[valid_final] = sum_xy[valid_final] / sum_x2[valid_final]
+
+    return a_map, count_valid
+
+
+# ============================================================
+# 7️⃣ Identify noisy pixels in raw pixel-wise a maps
+# ============================================================
+
+def make_noisy_pixel_mask(a_map, count_map, min_count=2, win=7, local_thresh=3.0, min_mad=0.15):
+    a_work = a_map.copy()
+    bad_mask = np.zeros(a_map.shape, dtype=bool)
+
+    # remove values outside [0, 1] before cleaning
+    out_of_range_mask = np.isfinite(a_work) & ((a_work < 0) | (a_work > 1))
+    bad_mask |= out_of_range_mask
+
+    # weakly supported pixels
+    bad_mask |= (count_map < min_count)
+
+    a_work[bad_mask] = np.nan
+
+    def nanmedian_filter(values):
+        values = values[~np.isnan(values)]
+        return np.nanmedian(values) if len(values) > 0 else np.nan
+
+    local_median = generic_filter(
+        a_work, nanmedian_filter, size=win, mode="constant", cval=np.nan
+    )
+
+    def local_mad(values):
+        values = values[~np.isnan(values)]
+        if len(values) == 0:
+            return np.nan
+        med = np.nanmedian(values)
+        return np.nanmedian(np.abs(values - med))
+
+    local_mad_map = generic_filter(
+        a_work, local_mad, size=win, mode="constant", cval=np.nan
+    )
+
+    diff = np.abs(a_work - local_median)
+    thresh = local_thresh * np.maximum(local_mad_map, min_mad)
+
+    outlier_mask = np.isfinite(a_work) & np.isfinite(local_median) & (diff > thresh)
+    bad_mask |= outlier_mask
+
+    a_map_clean = a_work.copy()
+    a_map_clean[bad_mask] = np.nan
+
+    return bad_mask, a_map_clean
+
+
+# ============================================================
+# 8️⃣ Global chunk-map helpers
+# ============================================================
+
+def build_chunk_scalar_map(frame_shape, chunk_defs, scalar_dict):
+    out = np.full(frame_shape, np.nan, dtype=float)
+
+    for chunk_id, value in scalar_dict.items():
+        if chunk_id not in chunk_defs:
+            continue
+        r0, r1 = chunk_defs[chunk_id]["row_range"]
+        c0, c1 = chunk_defs[chunk_id]["col_range"]
+        out[r0:r1, c0:c1] = value
+
+    return out
+
+
+def plot_scalar_chunk_map(arr, title, save_path=None):
+    plt.figure(figsize=(7, 6))
+    im = plt.imshow(arr, cmap="RdBu", vmin=-2, vmax=2)
+    plt.colorbar(im)
+    plt.title(title)
+    plt.axis("off")
     plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+
+
+def get_chunk_centres(chunk_defs):
+    centres = {}
+    for chunk_id, meta in chunk_defs.items():
+        r0, r1 = meta["row_range"]
+        c0, c1 = meta["col_range"]
+        centres[chunk_id] = ((r0 + r1) / 2.0, (c0 + c1) / 2.0)
+    return centres
+
+
+def fill_unreliable_chunks_with_neighbours(original_global_dict, cleaned_global_dict, chunk_defs):
+    """
+    Fill only chunks where:
+      - original global value is finite
+      - cleaned global value is NaN
+    Do NOT fill chunks that were already NaN in the original global map.
+    """
+    filled = cleaned_global_dict.copy()
+    centres = get_chunk_centres(chunk_defs)
+
+    # chunks eligible for replacement: finite in original, NaN in cleaned
+    target_chunk_ids = [
+        cid for cid in cleaned_global_dict
+        if np.isfinite(original_global_dict.get(cid, np.nan)) and np.isnan(cleaned_global_dict.get(cid, np.nan))
+    ]
+
+    # valid neighbours must also come from chunks finite in cleaned map
+    valid_ids = [cid for cid, val in cleaned_global_dict.items() if np.isfinite(val)]
+
+    for cid in target_chunk_ids:
+        if cid not in centres:
+            continue
+
+        rc, cc = centres[cid]
+        neigh = []
+
+        for vid in valid_ids:
+            if vid == cid or vid not in centres:
+                continue
+
+            rv, cv = centres[vid]
+            dist = np.hypot(rc - rv, cc - cv)
+            if dist == 0:
+                continue
+
+            neigh.append((dist, cleaned_global_dict[vid]))
+
+        if len(neigh) == 0:
+            filled[cid] = np.nan
+            continue
+
+        neigh.sort(key=lambda x: x[0])
+        neigh = neigh[:8]
+
+        dists = np.array([x[0] for x in neigh], dtype=float)
+        vals = np.array([x[1] for x in neigh], dtype=float)
+        weights = 1.0 / dists
+
+        filled[cid] = np.sum(weights * vals) / np.sum(weights)
+
+    return filled
+
+
+# ============================================================
+# 9️⃣ Available loop products
+# ============================================================
+
+loop_root = os.path.join(data_dir, "loops")
+available_loop_products = set()
+
+if os.path.exists(loop_root):
+    for name in os.listdir(loop_root):
+        if "_" in name:
+            try:
+                long_baseline, short_baseline = map(int, name.split("_"))
+                available_loop_products.add((long_baseline, short_baseline))
+            except ValueError:
+                pass
+
+valid_n_values = get_estimable_n_values(
+    selected_baseline,
+    interval,
+    available_loop_products,
+    available_coh_categories,
+    max_n=1 + num_a,
+)
+
+if not valid_n_values:
+    raise ValueError(
+        f"No estimable a_n values for selected_baseline={selected_baseline} "
+        f"with available loop products {sorted(available_loop_products)}"
+    )
+
+print(f"Selected baseline: {selected_baseline}")
+print(f"Estimable n values: {valid_n_values}")
+print(f"Using coh_thresh={coh_thresh}")
+
+# ============================================================
+# 🔟 Output dirs
+# ============================================================
+
+an_root = os.path.join(data_dir, "an_chunks")
+global_dir = os.path.join(an_root, "global")
+global_clean_dir = os.path.join(an_root, "global_clean")
+pixel_dir = os.path.join(an_root, "pixel_maps")
+global_maps_dir = os.path.join(an_root, "global_maps")
+
+os.makedirs(global_dir, exist_ok=True)
+os.makedirs(global_clean_dir, exist_ok=True)
+os.makedirs(pixel_dir, exist_ok=True)
+os.makedirs(global_maps_dir, exist_ok=True)
+
+global_values_by_param = {f"a{n-1}": {} for n in valid_n_values}
+global_clean_values_by_param = {f"a{n-1}": {} for n in valid_n_values}
+global_clean_values_by_param_filled = {f"a{n-1}": {} for n in valid_n_values}
+
+# ============================================================
+# 1️⃣1️⃣ Chunkwise processing
+# ============================================================
+
+processed_chunk_summaries = []
+plotted = 0
+
+for chunk_idx, chunk_id in enumerate(valid_chunks, start=1):
+    cr, cc = chunk_id
+    print(f"\nProcessing chunk {chunk_idx}/{len(valid_chunks)}: r{cr:03d}, c{cc:03d}")
+
+    coh_long_payload = load_coh_chunk(selected_baseline, chunk_id)
+    coh_base_payload = load_coh_chunk(interval, chunk_id)
+
+    if coh_long_payload is None or coh_base_payload is None:
+        print("  Skipping chunk: missing required coherence chunk.")
+        continue
+
+    coh_long = coh_long_payload["data"]
+    coh_short_base = coh_base_payload["data"]
+
+    chunk_meta = {
+        "chunk_id": chunk_id,
+        "row_range": coh_long_payload["row_range"],
+        "col_range": coh_long_payload["col_range"],
+        "valid_fraction": coh_long_payload["valid_fraction"],
+    }
+
+    chunk_rows = chunk_meta["row_range"][1] - chunk_meta["row_range"][0]
+    chunk_cols = chunk_meta["col_range"][1] - chunk_meta["col_range"][0]
+    chunk_npix = chunk_rows * chunk_cols
+    min_total_valid_pixels = max(1, int(np.ceil(0.03 * chunk_npix)))
+
+    loop_base_payload = load_loop_chunk(selected_baseline, interval, chunk_id)
+    if loop_base_payload is None:
+        print("  Skipping chunk: missing required base loop chunk.")
+        continue
+
+    loop_base_all = loop_base_payload["data"]
+    n_short_base = selected_baseline // interval
+
+    loop_base = coherence_mask_loops_for_an(
+        loop_base_all, coh_long, coh_short_base, n_short_base, coh_thresh
+    )
+
+    loop_base = [
+        arr.astype(float) if isinstance(arr, np.ndarray) else None
+        for arr in loop_base
+    ]
+
+    chunk_global_values = {}
+    chunk_global_clean_values = {}
+    chunk_pixel_dict = {}
+
+    for n in valid_n_values:
+        short_len_n = n * interval
+        param_name = f"a{n-1}"
+
+        print(f"  Computing {param_name} in chunk using short baseline {short_len_n}")
+
+        loop_n_payload = load_loop_chunk(selected_baseline, short_len_n, chunk_id)
+        coh_short_n_payload = load_coh_chunk(short_len_n, chunk_id)
+
+        if loop_n_payload is None or coh_short_n_payload is None:
+            print(f"    Missing loop/coh chunk for {param_name}; skipping.")
+            continue
+
+        loop_n_all = loop_n_payload["data"]
+        coh_short_n = coh_short_n_payload["data"]
+
+        n_short_n = selected_baseline // short_len_n
+        loop_n_masked = coherence_mask_loops_for_an(
+            loop_n_all, coh_long, coh_short_n, n_short_n, coh_thresh
+        )
+
+        loop_n_masked = [
+            arr.astype(float) if isinstance(arr, np.ndarray) else None
+            for arr in loop_n_masked
+        ]
+
+        ratio_val, reg_val = calc_an(loop_n_masked, loop_base)
+        chunk_global_values[param_name] = {
+            "ratio": ratio_val,
+            "regression": reg_val,
+        }
+        global_values_by_param[param_name][chunk_id] = reg_val
+
+        print(
+            f"    original global regression={reg_val:.6f}"
+            if not np.isnan(reg_val) else "    original global regression=nan"
+        )
+
+        try:
+            a_map, a_count = pixelwise_regression(loop_base, loop_n_masked)
+        except ValueError:
+            print(f"    No valid data found for pixelwise regression of {param_name}")
+            continue
+
+        bad_mask, a_map_clean = make_noisy_pixel_mask(
+            a_map,
+            a_count,
+            min_count=min_count_for_cleaning,
+            win=local_window_size,
+            local_thresh=local_thresh,
+            min_mad=min_mad,
+        )
+
+        ratio_clean, reg_clean, total_valid_count, n_after_robust = calc_an_with_bad_pixel_mask(
+            loop_n_masked,
+            loop_base,
+            bad_mask,
+            min_total_valid=min_total_valid_pixels,
+            sigma=robust_sigma,
+            min_mad_local=robust_min_mad,
+        )
+
+        unreliable = np.isnan(reg_clean)
+
+        chunk_global_clean_values[param_name] = {
+            "ratio": ratio_clean,
+            "regression": reg_clean,
+            "total_valid_count": total_valid_count,
+            "min_required_valid_count": min_total_valid_pixels,
+            "n_after_robust": n_after_robust,
+            "unreliable": unreliable,
+        }
+        global_clean_values_by_param[param_name][chunk_id] = reg_clean
+
+        if not np.isnan(reg_clean):
+            print(
+                f"    cleaned global regression={reg_clean:.6f} "
+                f"(valid={total_valid_count}, robust_keep={n_after_robust})"
+            )
+        else:
+            print(
+                f"    cleaned global regression=nan "
+                f"(valid={total_valid_count}, min_required={min_total_valid_pixels})"
+            )
+
+        if np.isnan(reg_clean):
+            a_map_filled = a_map_clean.copy()
+        else:
+            a_map_filled = np.where(np.isnan(a_map_clean), reg_clean, a_map_clean)
+
+        chunk_pixel_dict[param_name] = a_map_filled
+        chunk_pixel_dict[f"{param_name}_raw"] = a_map
+        chunk_pixel_dict[f"{param_name}_clean"] = a_map_clean
+        chunk_pixel_dict[f"{param_name}_count"] = a_count
+        chunk_pixel_dict[f"{param_name}_bad_mask"] = bad_mask
+        chunk_pixel_dict[f"{param_name}_global"] = reg_val
+        chunk_pixel_dict[f"{param_name}_global_clean"] = reg_clean
+
+        if plot_chunk_results and plotted < plot_first_n_chunks:
+            def plot_map(arr, title):
+                plt.figure(figsize=(5, 4))
+                im = plt.imshow(arr, cmap="RdBu", vmin=-2, vmax=2)
+                plt.colorbar(im)
+                plt.title(title)
+                plt.axis("off")
+                plt.tight_layout()
+
+            plot_map(a_map, f"{param_name} raw\nchunk r{cr:03d} c{cc:03d}")
+            plot_map(bad_mask.astype(float), f"{param_name} bad mask\nchunk r{cr:03d} c{cc:03d}")
+            plot_map(a_map_clean, f"{param_name} clean\nchunk r{cr:03d} c{cc:03d}")
+            plot_map(a_map_filled, f"{param_name} filled\nchunk r{cr:03d} c{cc:03d}")
+
+    if plot_chunk_results and plotted < plot_first_n_chunks:
+        plt.show()
+        plotted += 1
+
+    save_pickle(
+        os.path.join(global_dir, f"chunk_r{cr:03d}_c{cc:03d}.pkl"),
+        {
+            **chunk_meta,
+            "selected_baseline": selected_baseline,
+            "values": chunk_global_values,
+        },
+    )
+
+    save_pickle(
+        os.path.join(global_clean_dir, f"chunk_r{cr:03d}_c{cc:03d}.pkl"),
+        {
+            **chunk_meta,
+            "selected_baseline": selected_baseline,
+            "values": chunk_global_clean_values,
+        },
+    )
+
+    save_pickle(
+        os.path.join(pixel_dir, f"chunk_r{cr:03d}_c{cc:03d}.pkl"),
+        {
+            **chunk_meta,
+            "selected_baseline": selected_baseline,
+            "maps": chunk_pixel_dict,
+        },
+    )
+
+    processed_chunk_summaries.append(
+        {
+            **chunk_meta,
+            "selected_baseline": selected_baseline,
+            "global_keys": sorted(chunk_global_values.keys()),
+            "global_clean_keys": sorted(chunk_global_clean_values.keys()),
+            "pixel_keys": sorted([
+                k for k in chunk_pixel_dict.keys()
+                if not k.endswith(("_raw", "_clean", "_count", "_bad_mask", "_global", "_global_clean"))
+            ]),
+        }
+    )
+
+# ============================================================
+# 1️⃣2️⃣ Fill unreliable chunk-global values from neighbours
+# ============================================================
+
+unreliable_chunk_counts = {}
+replaced_chunk_ids_by_param = {}
+
+for n in valid_n_values:
+    param_name = f"a{n-1}"
+
+    original_global_vals = global_values_by_param[param_name]
+    cleaned_vals = global_clean_values_by_param[param_name]
+
+    filled_vals = fill_unreliable_chunks_with_neighbours(
+        original_global_vals,
+        cleaned_vals,
+        chunk_defs,
+    )
+    global_clean_values_by_param_filled[param_name] = filled_vals
+
+    replaced_ids = []
+    for chunk_id in cleaned_vals:
+        orig_global_val = original_global_vals.get(chunk_id, np.nan)
+        clean_val = cleaned_vals.get(chunk_id, np.nan)
+        fill_val = filled_vals.get(chunk_id, np.nan)
+
+        if np.isfinite(orig_global_val) and np.isnan(clean_val) and np.isfinite(fill_val):
+            replaced_ids.append(chunk_id)
+
+    unreliable_chunk_counts[param_name] = len(replaced_ids)
+    replaced_chunk_ids_by_param[param_name] = replaced_ids
+
+for chunk_id in valid_chunks:
+    cr, cc = chunk_id
+    clean_file = os.path.join(global_clean_dir, f"chunk_r{cr:03d}_c{cc:03d}.pkl")
+    if not os.path.exists(clean_file):
+        continue
+
+    payload = load_pickle(clean_file)
+    vals = payload.get("values", {})
+
+    for n in valid_n_values:
+        param_name = f"a{n-1}"
+        if param_name not in vals:
+            continue
+
+        orig_global_val = global_values_by_param[param_name].get(chunk_id, np.nan)
+        clean_val = vals[param_name].get("regression", np.nan)
+        filled_val = global_clean_values_by_param_filled[param_name].get(chunk_id, np.nan)
+
+        used_fill = bool(
+            np.isfinite(orig_global_val) and np.isnan(clean_val) and np.isfinite(filled_val)
+        )
+
+        vals[param_name]["regression_filled_from_neighbours"] = filled_val
+        vals[param_name]["used_neighbour_fill"] = used_fill
+
+    save_pickle(clean_file, payload)
+
+# ============================================================
+# 1️⃣3️⃣ Build and plot/save global chunk maps
+# ============================================================
+
+global_map_files = {}
+global_clean_map_files = {}
+global_clean_filled_map_files = {}
+
+for n in valid_n_values:
+    param_name = f"a{n-1}"
+
+    global_map = build_chunk_scalar_map(
+        frame_shape=frame_shape,
+        chunk_defs=chunk_defs,
+        scalar_dict=global_values_by_param[param_name],
+    )
+
+    global_clean_map = build_chunk_scalar_map(
+        frame_shape=frame_shape,
+        chunk_defs=chunk_defs,
+        scalar_dict=global_clean_values_by_param[param_name],
+    )
+
+    global_clean_filled_map = build_chunk_scalar_map(
+        frame_shape=frame_shape,
+        chunk_defs=chunk_defs,
+        scalar_dict=global_clean_values_by_param_filled[param_name],
+    )
+
+    if save_global_chunk_maps:
+        global_map_path = os.path.join(global_maps_dir, f"{param_name}_global_chunk_map.png")
+        global_clean_map_path = os.path.join(global_maps_dir, f"{param_name}_global_clean_chunk_map.png")
+        global_clean_filled_map_path = os.path.join(global_maps_dir, f"{param_name}_global_clean_filled_chunk_map.png")
+
+        plot_scalar_chunk_map(
+            global_map,
+            f"{param_name} original global values over all chunks",
+            save_path=global_map_path,
+        )
+        plt.close()
+
+        plot_scalar_chunk_map(
+            global_clean_map,
+            f"{param_name} cleaned global values over all chunks",
+            save_path=global_clean_map_path,
+        )
+        plt.close()
+
+        plot_scalar_chunk_map(
+            global_clean_filled_map,
+            f"{param_name} cleaned global values filled from neighbours",
+            save_path=global_clean_filled_map_path,
+        )
+        plt.close()
+
+        global_map_files[param_name] = global_map_path
+        global_clean_map_files[param_name] = global_clean_map_path
+        global_clean_filled_map_files[param_name] = global_clean_filled_map_path
+
+    if plot_global_chunk_maps:
+        plot_scalar_chunk_map(
+            global_map,
+            f"{param_name} original global values over all chunks",
+            save_path=None,
+        )
+        plot_scalar_chunk_map(
+            global_clean_map,
+            f"{param_name} cleaned global values over all chunks",
+            save_path=None,
+        )
+        plot_scalar_chunk_map(
+            global_clean_filled_map,
+            f"{param_name} cleaned global values filled from neighbours",
+            save_path=None,
+        )
+
+if plot_global_chunk_maps:
     plt.show()
 
+# ============================================================
+# 1️⃣4️⃣ Save unreliable chunk report
+# ============================================================
 
-##
-######### forming 360-6
+report_file = os.path.join(an_root, "unreliable_chunk_report.txt")
+with open(report_file, "w") as f:
+    f.write("Report on unreliable chunks replaced by neighbour values\n")
+    for n in valid_n_values:
+        param_name = f"a{n-1}"
+        count = unreliable_chunk_counts.get(param_name, 0)
+        f.write(f"{param_name}: {count} chunks replaced\n")
 
-loop_360_6_all = np.array(all_loops[long_baseline][interval], dtype=object)
-coh_360 = np.array(coh[long_baseline][:], dtype=object)
+print("\nReport on unreliable chunks replaced by neighbour values:")
+for n in valid_n_values:
+    param_name = f"a{n-1}"
+    count = unreliable_chunk_counts.get(param_name, 0)
+    print(f"  {param_name}: {count} chunks replaced")
 
-loop_360_6 = np.full_like(
-    loop_360_6_all, np.nan
-)  # create a new array as the same size of loop_360_6_all with nan values
+# ============================================================
+# 1️⃣5️⃣ Save index
+# ============================================================
 
+an_chunk_index = {
+    "selected_baseline": selected_baseline,
+    "interval": interval,
+    "num_a": num_a,
+    "coh_thresh": coh_thresh,
+    "valid_n_values": valid_n_values,
+    "min_count_for_cleaning": min_count_for_cleaning,
+    "local_window_size": local_window_size,
+    "local_thresh": local_thresh,
+    "min_mad": min_mad,
+    "robust_sigma": robust_sigma,
+    "robust_min_mad": robust_min_mad,
+    "processed_chunks": processed_chunk_summaries,
+    "global_map_files": global_map_files,
+    "global_clean_map_files": global_clean_map_files,
+    "global_clean_filled_map_files": global_clean_filled_map_files,
+    "unreliable_chunk_counts": unreliable_chunk_counts,
+    "replaced_chunk_ids_by_param": replaced_chunk_ids_by_param,
+}
 
-for i, arr in enumerate(loop_360_6_all):
-    if arr is not None:
-        (frame_row, frame_col) = np.shape(arr)
-        loop_360_6[i] = np.where((coh_360[i] > coh_thresh), arr, np.nan)
+save_pickle(os.path.join(an_root, "an_chunk_index.pkl"), an_chunk_index)
 
-###### forming 360-n (n=12,18,24 etc)
-# mean_a_long_baseline = []
-final_mean_values = []
-an_labels = []
-
-# Loop through the values of k corresponding to the number of calibration parameters
-for k in range(2, 2 + num_a):  # k=2 for a1, k=3 for a2, etc.
-    mean_an_long_baseline = []
-
-    # Forming 360-n (n=12, 18, 24, etc.)
-    loop_360_n_all = np.array(all_loops[long_baseline][k * interval], dtype=object)
-    loop_360_n = np.full_like(loop_360_n_all, np.nan)
-
-    for i, arr in enumerate(loop_360_n_all):
-        if arr is not None:
-            # Apply coherence threshold filtering
-            loop_360_n[i] = np.where((coh_360[i] > coh_thresh), arr, np.nan)
-
-    # Calculate a_n values
-    mean_an_long_baseline, an_arrays = calc_an(loop_360_n, loop_360_6)
-
-    # If all values in mean_an_long_baseline are nan (empty ratios), stop execution
-    if np.isnan(mean_an_long_baseline).all():
-        print("No valid a_n values could be calculated. Stopping execution.")
-        sys.exit(1)  # Exit the script with an error code (1 means failure)
-
-    # Calculate the mean of all mean values for this k and store it
-    overall_mean = np.nanmean(mean_an_long_baseline)
-    final_mean_values.append(overall_mean)
-    an_labels.append(f"a{k-1}")
-
-    for idx, mean_a in enumerate(mean_an_long_baseline, start=1):
-        if not np.isnan(mean_a):  # Check if the value is not NaN
-            print(f"Mean of the {idx}th a({k-1}) is {mean_a:.6f}")
-
-    plot_an(an_arrays, mean_an_long_baseline, k)
-
-
-# Print the final mean values across all k
-for k_idx, final_mean in enumerate(final_mean_values, start=2):
-    print(f"Final mean value for a({k_idx-1}) is {final_mean:.6f}")
-
-# Write final mean values to a text file
-output_path = os.path.join(parameters["output_path"], "Data")
-os.makedirs(output_path, exist_ok=True)  # Create directory if it doesn't exist
-output_file = os.path.join(output_path, "an.txt")
-
-with open(output_file, "w") as file:
-    for label, mean_value in zip(an_labels, final_mean_values):
-        file.write(f"{label}={mean_value:.6f}\n")
-
-print(f"Final mean values written to {output_file}.")
+print("\nChunkwise a_n estimation completed.")
+print(f"Saved global chunk values to: {global_dir}")
+print(f"Saved cleaned global chunk values to: {global_clean_dir}")
+print(f"Saved pixel-wise chunk maps to: {pixel_dir}")
+print(f"Saved global chunk plots to: {global_maps_dir}")
+print(f"Saved unreliable chunk report to: {report_file}")
+print(f"Saved chunk index to: {os.path.join(an_root, 'an_chunk_index.pkl')}")

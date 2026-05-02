@@ -1,535 +1,860 @@
 #!/usr/bin/env python3
 
-import numpy as np
-from datetime import datetime
-import pickle
-import time
 import os
-from bin.generate_ifgs_from_epochs import generate_ifg_pairs
-import configparser
-import glob
-from bin.resample import resample_geotiff
 import sys
-
-# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-import bin
-from bin.read_orig_ifgs_coh import read_orig_ifgs_coh
-
-from bin.ifg_cc_totif import ifg_cc_2tif
 import gc
+import pickle
+import argparse
+import configparser
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-###############################################################################
+import numpy as np
+
+from bin.generate_ifgs_from_epochs import generate_ifg_pairs
+from bin.resample import resample_geotiff
+from bin.ifg_cc_totif import ifg_cc_2tif
+
 
 HELP_TEXT = """
-PhaseBias_05_Correction.py
+PhaseBias_04_Apply_Phase_Bias_Correction_Chunked_To_GEOC.py
 
-This script applies phase bias correction to desired interferograms using the estimated bias terms for the base interferograms. The corrected interferograms are saved in GeoTIFF format for further analysis.
+This script applies phase-bias correction using chunked inputs and chunked
+inversion results, but writes the final outputs in the same GEOC directory
+structure as the old script.
 
-### Workflow:
-1. **Inputs:**
-   - **Original Wrapped Interferograms, and Coherence Data:** Obtained from step 1 (`PhaseBias_01_Read_Data.py`).
-   - **Estimated Bias Terms for Base Intierferograms:** Obtained from step 4 (`PhaseBias_04_Inversion.py`).
-   - **Calibration Parameters (*a_n*):** Estimated from step 3 (`PhaseBias_03_calibration_pars.py`).
-   - **max_con:** Defines the maximum number of connections to be corrected. For instance:
-     - `max_con=5` corrects interferograms up to 30-day intervals for a 6-day acquisition interval.
-     - Adjust `max_con` as needed.
+It uses:
+1. Chunked wrapped IFGs from Data/ifgs/
+2. Chunked coherence from Data/coh/
+3. Chunked base bias terms from Data/X_chunks/
+4. a_n values/maps from:
+   - config.txt
+   - Data/an_per_long_baseline.txt / an_chunks/global(_clean)
+   - Data/an_chunks/pixel_maps
 
-2. **Bias Term Estimation for Desired Interferograms:**
-   - Bias terms for desired interferograms, δ_(i,i+n+1), are estimated using the relationship:
-     δ_(i,i+n+1) = a_n * (∑_(t=i)^(i+n) δ_(t,t+1) )
+Output:
+GEOC/
+  yyyymmdd_yyyymmdd/
+    yyyymmdd_yyyymmdd.geo.diff_pha.tif
+    yyyymmdd_yyyymmdd.geo.cc.tif
 
-3. **Correction of Interferograms:**
-   - Using the estimated bias terms, the interferograms are corrected as follows:
-     φ_(i,i+n+1)^c = φ_(i,i+n+1) - δ_(i,i+n+1)
-
-   - Here, φ_(i,i+n+1) is the original interferogram, and φ_(i,i+n+1)^c is the corrected interferogram.
-
-4. **Outputs:**
-   - Corrected interferograms are saved in GeoTIFF format in the `GEOC` directory under the `output_path` specified in `config.txt`.
-
-### Output File Format:
-- **Corrected Interferograms:** Saved in GeoTIFF format, organized by temporal baseline.
-
-### Input Requirements:
-- Original wrapped interferograms from step 1.
-- Bias terms for base interferograms from step 4.
-- Configuration parameters (e.g., `output_path`, `interval`) defined in `config.txt`.
-
-### Output Directory:
-- `GEOC` directory under `output_path`: Contains the corrected interferograms in GeoTIFF format, organized by temporal baseline.
-
+Parallelism:
+- --n_workers: chunk correction stage
+- --n_write_workers: GEOC writing stage (parallel by category)
 """
+
 if "--help" in sys.argv:
     print(HELP_TEXT)
     sys.exit(0)
 
 
-################################################################################
+# ======================================================================================
+# Config / IO helpers
+# ======================================================================================
+
+def read_config(config_file="config.txt"):
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(
+            f"Error: The configuration file '{config_file}' was not found."
+        )
+
+    config = configparser.ConfigParser()
+    config.read(config_file)
+
+    params = {}
+    try:
+        params["root_path"] = config.get("DEFAULT", "root_path")
+        params["output_path"] = config.get("DEFAULT", "output_path")
+        params["frame"] = config.get("DEFAULT", "frame")
+        params["start"] = config.get("DEFAULT", "start")
+        params["end"] = config.get("DEFAULT", "end")
+        params["interval"] = config.getint("DEFAULT", "interval")
+        params["nlook"] = config.getint("DEFAULT", "nlook")
+        params["LiCSAR_data"] = config.get("DEFAULT", "LiCSAR_data")
+
+        params["a1_6_day"] = config.getfloat("DEFAULT", "a1_6_day")
+        params["a2_6_day"] = config.getfloat("DEFAULT", "a2_6_day")
+        params["a3_6_day"] = config.getfloat("DEFAULT", "a3_6_day")
+        params["a4_6_day"] = config.getfloat("DEFAULT", "a4_6_day")
+
+        params["a1_12_day"] = config.getfloat("DEFAULT", "a1_12_day")
+        params["a2_12_day"] = config.getfloat("DEFAULT", "a2_12_day")
+        params["a3_12_day"] = config.getfloat("DEFAULT", "a3_12_day")
+        params["a4_12_day"] = config.getfloat("DEFAULT", "a4_12_day")
+
+        params["estimate_an_mode"] = config.get("DEFAULT", "estimate_an_mode").strip().lower()
+
+    except configparser.NoOptionError as e:
+        raise ValueError(f"Missing required config parameter: {e}")
+
+    allowed_modes = {"config", "global", "pixel"}
+    if params["estimate_an_mode"] not in allowed_modes:
+        raise ValueError(
+            f"estimate_an_mode must be one of {sorted(allowed_modes)}, "
+            f"got '{params['estimate_an_mode']}'"
+        )
+
+    return params
 
 
-# Config file path
-config_file = "config.txt"
-
-# Check if config file exists
-if not os.path.exists(config_file):
-    raise FileNotFoundError(
-        f"Error: The configuration file '{config_file}' was not found in the script's directory."
-    )
-
-# Initialize the configparser
-config = configparser.ConfigParser()
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-# Read the config.txt file
-config.read(config_file)
-
-print("Config keys:", list(config.defaults().keys()))
-
-
-# Define required parameters
-required_parameters = [
-    "root_path",
-    "frame",
-    "start",
-    "end",
-    "interval",
-    "nlook",
-    "LiCSAR_data",
-    "a1_6_day",
-    "a2_6_day",
-    "a3_6_day",
-    "a4_6_day",
-    "a1_12_day",
-    "a2_12_day",
-    "a3_12_day",
-    "a4_12_day",
-    "estimate_an_values",
-]
-
-# Initialize a dictionary to store parameters
-parameters = {}
-
-# Attempt to retrieve each parameter and catch errors
-try:
-    parameters["root_path"] = config.get("DEFAULT", "root_path")
-    parameters["output_path"] = config.get("DEFAULT", "output_path")
-    parameters["frame"] = config.get("DEFAULT", "frame")
-    parameters["start"] = config.get("DEFAULT", "start")
-    parameters["end"] = config.get("DEFAULT", "end")
-    parameters["interval"] = config.getint("DEFAULT", "interval")
-    parameters["nlook"] = config.getint(
-        "DEFAULT", "nlook"
-    )  # Assuming 'nlook' should be an integer
-    parameters["LiCSAR_data"] = config.get("DEFAULT", "LiCSAR_data")
-    parameters["a1_6_day"] = config.getfloat("DEFAULT", "a1_6_day")
-    parameters["a2_6_day"] = config.getfloat("DEFAULT", "a2_6_day")
-    parameters["a3_6_day"] = config.getfloat("DEFAULT", "a3_6_day")
-    parameters["a4_6_day"] = config.getfloat("DEFAULT", "a4_6_day")
-    parameters["a1_12_day"] = config.getfloat("DEFAULT", "a1_12_day")
-    parameters["a2_12_day"] = config.getfloat("DEFAULT", "a2_12_day")
-    parameters["a3_12_day"] = config.getfloat("DEFAULT", "a3_12_day")
-    parameters["a4_12_day"] = config.getfloat("DEFAULT", "a4_12_day")
-    parameters["estimate_an_values"] = config.get("DEFAULT", "estimate_an_values")
-
-except configparser.NoOptionError as e:
-    # Error message if a required parameter is missing
-    missing_param = str(e).split(": ")[1]
-    raise ValueError(
-        f"Error: Required parameter '{missing_param}' is missing in '{config_file}'. Please check the file contents."
-    )
-except configparser.Error as e:
-    # General error for any configparser-related issues
-    raise ValueError(f"Error while reading '{config_file}': {e}")
-
-# Assign to individual variables for easy access
-root_path = parameters["root_path"]
-output_path = parameters["output_path"]
-frame = parameters["frame"]
-start = parameters["start"]
-end = parameters["end"]
-interval = parameters["interval"]
-nlook = parameters["nlook"]
-LiCSAR_data = parameters["LiCSAR_data"]
-estimate_an_values = parameters["estimate_an_values"]
+def save_pickle(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
 
 
-start_date = datetime.strptime(start, "%Y%m%d")
-end_date = datetime.strptime(end, "%Y%m%d")
+def load_chunk_index(output_path):
+    chunk_index_file = os.path.join(output_path, "Data", "chunk_index.pkl")
+    if not os.path.exists(chunk_index_file):
+        raise FileNotFoundError(
+            f"Chunk index not found: {chunk_index_file}\n"
+            f"Please run the chunked PhaseBias_01_Read_Data script first."
+        )
+    return load_pickle(chunk_index_file)
 
-uncor_only = 1  # in case of 1 only uses 6-12-18 uncorrected ifgs. it is based on the desired_lengths ifgs
-max_con = 5  # in case of 5, it will correct up to 6*5=30-day ifgs.
 
-
-#####################################################
-# Root directory where the category directories are located
-
-if LiCSAR_data == "yes":
-    track = frame[0:3]  # extracting track number from frame id
+def get_track_from_frame(frame_id):
+    track = frame_id[0:3]
     if track[0] == "0":
         track = track[1:3]
     if track[0] == "0":
         track = track[1:2]
-
-    root_directory = (
-        f"/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/{track}/{frame}"
-    )
-else:
-    root_directory = root_path
+    return track
 
 
-############################################
+def get_root_directory(root_path, frame, LiCSAR_data):
+    if LiCSAR_data == "yes":
+        track = get_track_from_frame(frame)
+        return f"/gws/nopw/j04/nceo_geohazards_vol1/public/LiCSAR_products/{track}/{frame}"
+    return root_path
 
-# Initialize the an values with None for safety
-an_values = [None] * (
-    max_con - 1
-)  # For max_con=5, this will create [None, None, None, None]
 
-print("estimate_an_values is ", estimate_an_values)
+def get_config_an_values(params, max_con):
+    interval = params["interval"]
+    an_values = []
 
-# Check if estimate_an_values is 'yes'
-if estimate_an_values == "yes":
-    an_file_path = os.path.join(output_path, "Data", "an.txt")
-
-    # Try reading the file
-    try:
-        if os.path.exists(an_file_path):
-            print(f"Reading 'a' values from {an_file_path}...")
-
-            # Read the file and load the an values dynamically
-            with open(an_file_path, "r") as file:
-                for line in file:
-                    line = line.strip()
-                    for i in range(
-                        1, max_con
-                    ):  # Loop through a1, a2, ..., a(max_con-1)
-                        param_name = f"a{i}"
-                        if line.startswith(f"{param_name}="):
-                            an_values[i - 1] = float(line.split("=")[1])
-
-            # Check if all required an values were found
-            if any(value is None for value in an_values):
-                print(
-                    "Warning: Missing one or more an values in an.txt. Switching to default values from config file."
-                )
-                raise ValueError("Incomplete an values.")
-        else:
-            print(
-                f"Warning: {an_file_path} does not exist. Switching to default values from config file."
-            )
-            raise FileNotFoundError
-
-    except (FileNotFoundError, ValueError):
-        # Fallback to default values from config file
-        print("Loading default 'an' values from config file...")
-        for i in range(1, max_con):
-            if interval == 6:
-                an_values[i - 1] = parameters[f"a{i}_6_day"]
-            else:
-                an_values[i - 1] = parameters[f"a{i}_12_day"]
-else:
-    # Use default values from the config file
-    print("Using default 'an' values from the config file.")
     for i in range(1, max_con):
-        if interval == 6:
-            an_values[i - 1] = parameters[f"a{i}_6_day"]
-        else:
-            an_values[i - 1] = parameters[f"a{i}_12_day"]
+        key = f"a{i}_{interval}_day"
+        if key not in params:
+            raise ValueError(f"Missing config parameter: {key}")
+        an_values.append(params[key])
 
-# Print the chosen an values
-for i, value in enumerate(an_values, start=1):
-    print(f"Final value - a{i}: {value}")
+    return an_values
 
 
-############## generating ifg pairs between two epochs
+def load_global_a_values_from_text(output_path, fallback_an, max_con):
+    file_path = os.path.join(output_path, "Data", "an_per_long_baseline.txt")
+    if not os.path.exists(file_path):
+        return fallback_an.copy()
 
-# desired_lengths = [interval, 2*interval, 3*interval, 4*interval, 5*interval]
-desired_lengths = [interval * i for i in range(1, max_con + 1)]  # replacing the above
+    an_values = fallback_an.copy()
 
-all_ifgs_string = generate_ifg_pairs(start_date, end_date, interval, desired_lengths)
+    with open(file_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if "=" not in line:
+                continue
 
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
 
-##### reading original ifgs/coh  #############################
-####################################################################################
+            if key.startswith("a"):
+                try:
+                    idx = int(key[1:])
+                except ValueError:
+                    continue
+                if 1 <= idx < max_con:
+                    an_values[idx - 1] = float(value)
 
-############################### Reading input data #############################################
-#################### Read ifgs:
-print("Reading all ifgs...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern = "All_ifgs_*"  # Pattern to match files starting with "All_ifgs"
-
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        ifgs = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
+    return an_values
 
 
-###################### Read coh:
-print("\nReading all coherence data...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern = "All_coh_*"  # Pattern to match files starting with "All_ifgs"
+def chunk_file_path(output_path, kind, category_or_name, chunk_id):
+    cr, cc = chunk_id
 
-# Construct the full file path with the refined pattern
-file_path_pattern = os.path.join(output_path, sub_dir, filename_pattern)
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
+    if kind == "ifgs":
+        return os.path.join(
+            output_path, "Data", "ifgs", f"{category_or_name}d", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    if kind == "coh":
+        return os.path.join(
+            output_path, "Data", "coh", f"{category_or_name}d", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    if kind == "x":
+        return os.path.join(
+            output_path, "Data", "X_chunks", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    if kind == "an_global":
+        return os.path.join(
+            output_path, "Data", "an_chunks", "global", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    if kind == "an_global_clean":
+        return os.path.join(
+            output_path, "Data", "an_chunks", "global_clean", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    if kind == "an_pixel":
+        return os.path.join(
+            output_path, "Data", "an_chunks", "pixel_maps", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    if kind == "tmp_corrected_ifgs":
+        return os.path.join(
+            output_path, "Data", "corrected_tmp", "ifgs", f"{category_or_name}d", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
+    if kind == "tmp_corrected_coh":
+        return os.path.join(
+            output_path, "Data", "corrected_tmp", "coh", f"{category_or_name}d", f"chunk_r{cr:03d}_c{cc:03d}.pkl"
+        )
 
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        coh = pickle.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
-print("\nReading data completed.")
-
-
-######## stacking all the ifgs 6/12/18 in a numpy var all_ifgs
-desired_categories = desired_lengths
-print('stacking all the ifgs 6/12/18 in a numpy var all_ifgs')
-all_ifgs, all_coh, existing_ifgs_index = read_orig_ifgs_coh(
-    ifgs, coh, desired_categories
-)
-print('stacking completed')
-
-del ifgs, coh
-gc.collect()
-
-print('ifgs coh deleted')
-##### Reading the estimated bias terms as well as the indices of unknowns that can be corrected obtained in step 03  ##############
-##############################################################################################
-print("Correcting the interferograms...")
-# Define the path components
-sub_dir = "Data"
-filename_pattern_X = "X_base_ifgs_biases.npy"  # Pattern to match files starting with "X_base"
-filename_pattern_indices = "indices*"
-
-# Construct the full file path with the refined pattern
-file_path_pattern_X = os.path.join(output_path, sub_dir, filename_pattern_X)
-file_path_pattern_indices = os.path.join(output_path, sub_dir, filename_pattern_indices)
-
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern_X)
-
-if file_list:
-    file_path = file_list[0]  # string path to .npy file
-    X = np.load(file_path, mmap_mode="r")  # ✅ correct way
-else:
-    raise FileNotFoundError(f"No file matching '{filename_pattern_X}' was found in '{os.path.join(output_path, sub_dir)}'.")
+    raise ValueError(f"Unknown kind: {kind}")
 
 
-
-# Use glob to find the file and ensure it exists
-file_list = glob.glob(file_path_pattern_indices)
-if file_list:
-    file_path = file_list[0]  # Get the single file path directly
-
-    # Load the data from the file
-    with open(file_path, "rb") as file:
-        indices_unknown_tobe_corrected = np.load(file)
-else:
-    raise FileNotFoundError(
-        f"No file matching '{filename_pattern}' was found in '{os.path.join(output_dir, sub_dir)}'."
-    )
+def load_ifg_chunk(output_path, category, chunk_id):
+    path = chunk_file_path(output_path, "ifgs", category, chunk_id)
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
 
 
-#### loading indices of unknown that can be corrected and the estimated unknowns
-
-indices_unknown_tobe_corrected_orig = indices_unknown_tobe_corrected.copy()
-
-len_6_biases = indices_unknown_tobe_corrected[-1] + 1  # number of 6-day biases
-
-all_column_indices = np.array(
-    range(len_6_biases)
-)  # generating all indices in case we want to esimate all 6-day biases with smoothing constraints.
-indices_unknown_tobe_corrected = all_column_indices  # in this case we had provided the corrections for all 6-day biases
+def load_coh_chunk(output_path, category, chunk_id):
+    path = chunk_file_path(output_path, "coh", category, chunk_id)
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
 
 
-# extending the indices_unknown_tobe_corrected in the original approach to have the indices of 12/18 correctable ifgs:
-extended_indices = (
-    indices_unknown_tobe_corrected.copy()
-)  # because in this case indices_unknown_tobe_corrected referes to all_column_indices
-X_extended = (
-    X.copy()
-)  # because in this case we have estimated all 6-day biases but we don't need them for the correction. we just need them to correct the existing 12/18 days based on the 6 days
-
-extended_indices = extended_indices.tolist()
-X_extended = X_extended.tolist()
-print('indices loaded')
-
-# Generalized loop to handle any max_con
-for n in range(2, max_con + 1):  # Start from 2*interval and go up to (max_con)*interval
-    print('n is ', n)
-    current_length = n * interval  # Calculate the length (e.g., 12, 18, 24, ...)
-
-    if current_length in desired_lengths:  # Check if this length is required
-        for i in range(len(indices_unknown_tobe_corrected) - (n - 1)):
-            last_item = extended_indices[-1]  # Get the last index
-            extended_indices.append(last_item + 1)  # Append the new index
-
-            # Sum up X values for the current length (n)
-#            X_sum = sum(
-#                X[i + j, :, :] for j in range(n)
-#            )  # Sum over n consecutive indices
+def load_x_chunk(output_path, chunk_id):
+    path = chunk_file_path(output_path, "x", None, chunk_id)
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
 
 
-            X_sum = X[i : i + n].sum(axis=0) # more efficient
+def load_chunk_global_a_values(output_path, chunk_id, fallback_an, max_con):
+    an_values = fallback_an.copy()
+
+    path_clean = chunk_file_path(output_path, "an_global_clean", None, chunk_id)
+    path_raw = chunk_file_path(output_path, "an_global", None, chunk_id)
+
+    payload = None
+    if os.path.exists(path_clean):
+        payload = load_pickle(path_clean)
+    elif os.path.exists(path_raw):
+        payload = load_pickle(path_raw)
+
+    if payload is not None and "values" in payload:
+        vals = payload["values"]
+        for i in range(1, max_con):
+            key = f"a{i}"
+            if key in vals and "regression" in vals[key] and np.isfinite(vals[key]["regression"]):
+                an_values[i - 1] = float(vals[key]["regression"])
+
+    return an_values
 
 
-            # Append the result to X_extended using the corresponding an_values
-            X_extended.append(
-                an_values[n - 2]  # an_values is 0-based, so use n-2
-                * np.angle(np.exp(complex(0 + 1j) * X_sum))
-            )
+def load_chunk_pixel_a_maps(output_path, chunk_id, frame_shape, fallback_an, max_con):
+    global_fallback_an = load_chunk_global_a_values(output_path, chunk_id, fallback_an, max_con)
+
+    path = chunk_file_path(output_path, "an_pixel", None, chunk_id)
+    pixel_maps = {}
+
+    if not os.path.exists(path):
+        return pixel_maps, global_fallback_an
+
+    payload = load_pickle(path)
+    maps = payload.get("maps", payload)
+
+    for i in range(1, max_con):
+        key = f"a{i}"
+        if key in maps:
+            arr = np.array(maps[key], dtype=np.float32)
+            if arr.shape != frame_shape:
+                raise ValueError(
+                    f"Shape mismatch in pixel-wise map {key} for chunk {chunk_id}. "
+                    f"Expected {frame_shape}, got {arr.shape}."
+                )
+            arr = np.where(np.isnan(arr), global_fallback_an[i - 1], arr)
+            pixel_maps[key] = arr
+
+    return pixel_maps, global_fallback_an
 
 
-X = np.array(X_extended)
-indices_unknown_tobe_corrected = extended_indices
-del X_extended
-print('X extended')
-
-
-#### correcting the ifgs (6/12/18) ########################
-#################################################################
-
-
-#######  v3
 def wrap_to_pi_inplace(arr):
-    np.remainder(arr + np.pi, 2*np.pi, out=arr)
+    np.remainder(arr + np.pi, 2 * np.pi, out=arr)
     arr -= np.pi
     return arr
 
-print(f"all_ifgs.shape: {all_ifgs.shape}")
-print(f"len(indices_unknown_tobe_corrected): {len(indices_unknown_tobe_corrected)}")
-print(f"len(X): {len(X)}")
 
-all_ifgs_cor = np.full(all_ifgs.shape, np.nan, dtype=np.float32)
-if uncor_only == 0:  # if we want to use the corrected ifgs (using wrapped phases)
-    batch_size = 1  # adjust based on memory
-    for i in range(0, len(indices_unknown_tobe_corrected), batch_size):
-        print('batch ', i)
-        idx = indices_unknown_tobe_corrected[i:i+batch_size]
-        arr = all_ifgs[idx] - X[i:i+batch_size]
-        wrap_to_pi_inplace(arr)
-        all_ifgs_cor[idx] = arr
-else:
-    print("uncor_only = 1 → skipping correction, copying originals")
-    all_ifgs_cor[indices_unknown_tobe_corrected] = all_ifgs[indices_unknown_tobe_corrected]
+# ======================================================================================
+# Bias extension
+# ======================================================================================
 
-##################  v2
-#def wrap_to_pi(x):
-#    """Wrap values to [-pi, pi)."""
-#    return (x + np.pi) % (2 * np.pi) - np.pi
-#
-## Preallocate directly as float array filled with NaN
-#all_ifgs_cor = np.full(all_ifgs.shape, np.nan, dtype=np.float32)
-#
-#if uncor_only == 0:  # use corrected ifgs (wrapped phases)
-#    print('uncor_only 0')
-#    all_ifgs_cor[indices_unknown_tobe_corrected] = wrap_to_pi(all_ifgs[indices_unknown_tobe_corrected] - X)
-#else:  # no correction, just copy
-#    all_ifgs_cor[indices_unknown_tobe_corrected] = all_ifgs[indices_unknown_tobe_corrected]
+def extend_bias_stack_chunk(X_base, max_con, an_mode, an_values, pixel_a_maps=None):
+    len_base = X_base.shape[0]
+    X_extended = [X_base[i].astype(np.float32) for i in range(len_base)]
 
-############### #  v1
-# this was less efficient and so I replaced it with above
-#all_ifgs_cor = np.full_like(all_ifgs, None)
-#all_ifgs_cor[:, :, :] = np.nan
-#
-#if uncor_only == 0:  # if we want to use the corrected ifgs (using wrapped phases)
-#    all_ifgs_cor[indices_unknown_tobe_corrected, :, :] = np.angle(
-#        np.exp(
-#            complex(0 + 1j)
-#            * (all_ifgs[indices_unknown_tobe_corrected, :, :] - X[:, :, :])
-#        )
-#    )
-#else:  # no need for correction
-#    all_ifgs_cor[indices_unknown_tobe_corrected, :, :] = all_ifgs[
-#        indices_unknown_tobe_corrected, :, :
-#    ]
-#
-print ('before outputting')
+    for n in range(2, max_con + 1):
+        for i in range(len_base - (n - 1)):
+            X_sum = np.sum(X_base[i:i + n], axis=0).astype(np.float32)
 
-### Outputting to disk  ################
-#############################################################################
+            if an_mode == "pixel":
+                key = f"a{n-1}"
+                if pixel_a_maps is not None and key in pixel_a_maps:
+                    Xn = pixel_a_maps[key] * X_sum
+                else:
+                    Xn = an_values[n - 2] * X_sum
+            else:
+                Xn = an_values[n - 2] * X_sum
+
+            X_extended.append(Xn.astype(np.float32))
+
+    X = np.stack(X_extended, axis=0).astype(np.float32)
+    return X
 
 
-# Create the directory (and parent directories) if they don't exist
-GEOC_dir = "GEOC"
-metadata_dir = "metadata"
+# ======================================================================================
+# Stage 1: chunk correction worker
+# ======================================================================================
 
-output_wrap_dir = os.path.join(output_path, GEOC_dir)
-os.makedirs(
-    output_wrap_dir, exist_ok=True
-)  # create the GEOC directory if it doesn't exist
+def process_one_chunk(chunk_id, params, args_dict):
+    output_path = params["output_path"]
+    an_mode = params["estimate_an_mode"]
+    max_con = args_dict["max_con"]
+    uncor_only = args_dict["uncor_only"]
+    desired_lengths = args_dict["desired_lengths"]
 
-template_tif_path = os.path.join(root_directory, metadata_dir, frame + ".geo.hgt.tif")
-print('template_tif_path', template_tif_path)
-if nlook != 1:
-    resampled_tif_path = os.path.join(output_wrap_dir, frame + ".geo.hgt.tif")
-    print('template_tif_path', template_tif_path)
-    print('resampled_tif_path', resampled_tif_path)
-    print('nlook ', nlook)
+    config_an = get_config_an_values(params, max_con)
 
-    resample_geotiff(template_tif_path, resampled_tif_path, nlook)
-    template_tif_path = resampled_tif_path
+    x_payload = load_x_chunk(output_path, chunk_id)
+    if x_payload is None:
+        return {
+            "chunk_id": chunk_id,
+            "status": "skipped",
+            "reason": "missing X chunk",
+        }
 
-print('resample complete')
+    X_base = np.array(x_payload["X"], dtype=np.float32)
+    if X_base.shape[0] < 1:
+        return {
+            "chunk_id": chunk_id,
+            "status": "skipped",
+            "reason": "empty X chunk",
+        }
 
-total_files = len(all_ifgs)  # Total number of interferograms
-processed_files = 0  # Counter for processed files
+    frame_shape = X_base.shape[1:]
 
-print(f"Writing the corrected interferograms to {output_wrap_dir}")
-print("Progress: [", end="", flush=True)
-time.sleep(3)
+    pixel_a_maps = None
+    if an_mode == "config":
+        an_values = config_an
+        a_source = {"mode": "config", "scalar_values": an_values}
 
+    elif an_mode == "global":
+        text_global_an = load_global_a_values_from_text(output_path, config_an, max_con)
+        an_values = load_chunk_global_a_values(output_path, chunk_id, text_global_an, max_con)
+        a_source = {"mode": "global", "scalar_values": an_values}
 
-for i in range(len(all_ifgs)):
-    if i in indices_unknown_tobe_corrected:
+    elif an_mode == "pixel":
+        text_global_an = load_global_a_values_from_text(output_path, config_an, max_con)
+        pixel_a_maps, an_values = load_chunk_pixel_a_maps(
+            output_path, chunk_id, frame_shape, text_global_an, max_con
+        )
+        a_source = {
+            "mode": "pixel",
+            "scalar_fallback_values": an_values,
+            "available_pixel_maps": sorted(pixel_a_maps.keys()),
+        }
+    else:
+        return {
+            "chunk_id": chunk_id,
+            "status": "failed",
+            "reason": f"unknown estimate_an_mode: {an_mode}",
+        }
 
-        # Writing progress bar
-        processed_files += 1
-        percentage = (processed_files / total_files) * 100
-        if processed_files % (total_files // 100) == 0:  # Update progress every 1%
-            sys.stdout.write(
-                f"\rProgress: ["
-                + "=" * (int(percentage) // 2)
-                + " " * (50 - int(percentage) // 2)
-                + f"] {int(percentage)}%"
-            )
-            sys.stdout.flush()
+    X = extend_bias_stack_chunk(
+        X_base=X_base,
+        max_con=max_con,
+        an_mode=an_mode,
+        an_values=an_values,
+        pixel_a_maps=pixel_a_maps,
+    )
 
-        inpha = all_ifgs_cor[i, :, :]  # your phase input, float32
-        incoh = all_coh[i, :, :]  # your coh input. It can be either 0-255 or 0-1
+    len_base = X_base.shape[0]
+    x_start_by_n = {1: 0}
+    running = len_base
+    for n in range(2, max_con + 1):
+        x_start_by_n[n] = running
+        running += len_base - (n - 1)
 
-        output_phase_path = os.path.join(output_wrap_dir, all_ifgs_string[i])
-        output_cc_path = os.path.join(output_wrap_dir, all_ifgs_string[i])
+    corrected_categories = []
+    corrected_counts = {}
 
-        # output_phase_path = output_wrap_dir + all_ifgs_string[i]
-        # output_cc_path = output_wrap_dir + all_ifgs_string[i]
+    for category in desired_lengths:
+        ifg_payload = load_ifg_chunk(output_path, category, chunk_id)
+        coh_payload = load_coh_chunk(output_path, category, chunk_id)
 
-        os.makedirs(output_phase_path, exist_ok=True)
-        os.makedirs(output_cc_path, exist_ok=True)
+        if ifg_payload is None or coh_payload is None:
+            continue
 
-        output_phase_file = (
-            output_phase_path + "/" + all_ifgs_string[i] + ".geo.diff_pha.tif"
+        all_ifgs = ifg_payload["data"]
+        all_coh = coh_payload["data"]
+
+        n = category // params["interval"]
+        if n < 1:
+            continue
+
+        expected_count = len_base - (n - 1)
+        if expected_count <= 0:
+            continue
+
+        out_ifgs = []
+        out_coh = []
+
+        x_start = x_start_by_n[n]
+
+        for t in range(len(all_ifgs)):
+            if t >= expected_count:
+                out_ifgs.append(None)
+                out_coh.append(None)
+                continue
+
+            if all_ifgs[t] is None:
+                out_ifgs.append(None)
+                out_coh.append(all_coh[t] if t < len(all_coh) else None)
+                continue
+
+            if uncor_only == 1:
+                corrected = np.array(all_ifgs[t], dtype=np.float32, copy=True)
+            else:
+                bias = X[x_start + t]
+                corrected = np.angle(np.exp(1j * (np.array(all_ifgs[t], dtype=np.float32) - bias)))
+                wrap_to_pi_inplace(corrected)
+
+            out_ifgs.append(corrected.astype(np.float32))
+            out_coh.append(all_coh[t] if t < len(all_coh) else None)
+
+        save_pickle(
+            chunk_file_path(output_path, "tmp_corrected_ifgs", category, chunk_id),
+            {
+                "data": out_ifgs,
+                "category": category,
+                "chunk_id": chunk_id,
+                "row_range": ifg_payload["row_range"],
+                "col_range": ifg_payload["col_range"],
+                "valid_fraction": ifg_payload["valid_fraction"],
+                "estimate_an_mode": an_mode,
+                "a_source": a_source,
+                "uncor_only": uncor_only,
+            },
         )
 
-        output_cc_file = output_cc_path + "/" + all_ifgs_string[i] + ".geo.cc.tif"
+        save_pickle(
+            chunk_file_path(output_path, "tmp_corrected_coh", category, chunk_id),
+            {
+                "data": out_coh,
+                "category": category,
+                "chunk_id": chunk_id,
+                "row_range": coh_payload["row_range"],
+                "col_range": coh_payload["col_range"],
+                "valid_fraction": coh_payload["valid_fraction"],
+            },
+        )
 
-        ifg_cc_2tif(inpha, output_phase_file, template_tif_path)
-        ifg_cc_2tif(incoh, output_cc_file, template_tif_path)
+        corrected_categories.append(category)
+        corrected_counts[category] = sum(1 for item in out_ifgs if item is not None)
 
-print("\nAll corrected interferograms have been written to disk.")
+    del X_base, X
+    gc.collect()
+
+    return {
+        "chunk_id": chunk_id,
+        "status": "ok",
+        "corrected_categories": corrected_categories,
+        "corrected_counts": corrected_counts,
+        "a_source": a_source,
+        "uncor_only": uncor_only,
+    }
+
+
+# ======================================================================================
+# Stage 2: streaming GEOC writing helpers
+# ======================================================================================
+
+def load_tmp_corrected_chunk(output_path, category, chunk_id, kind):
+    if kind == "ifgs":
+        path = chunk_file_path(output_path, "tmp_corrected_ifgs", category, chunk_id)
+    elif kind == "coh":
+        path = chunk_file_path(output_path, "tmp_corrected_coh", category, chunk_id)
+    else:
+        raise ValueError("kind must be 'ifgs' or 'coh'")
+
+    if not os.path.exists(path):
+        return None
+    return load_pickle(path)
+
+
+def get_n_times_for_category(output_path, category, valid_chunks):
+    for chunk_id in valid_chunks:
+        payload = load_tmp_corrected_chunk(output_path, category, chunk_id, "ifgs")
+        if payload is not None:
+            return len(payload["data"])
+    return 0
+
+
+def write_one_category_to_geoc(
+    category,
+    output_path,
+    valid_chunks,
+    frame_shape,
+    ifg_names_for_category,
+    output_wrap_dir,
+    template_tif_path,
+):
+    """
+    Worker for one category:
+    - stream stitch one epoch at a time
+    - write final GEOC files for this category only
+    """
+    n_times = get_n_times_for_category(output_path, category, valid_chunks)
+    if n_times == 0:
+        return {
+            "category": category,
+            "status": "skipped",
+            "written": 0,
+            "n_times": 0,
+        }
+
+    written = 0
+
+    for t in range(n_times):
+        full_ifg = np.full(frame_shape, np.nan, dtype=np.float32)
+        full_coh = np.full(frame_shape, np.nan, dtype=np.float32)
+
+        has_ifg = False
+        has_coh = False
+
+        for chunk_id in valid_chunks:
+            ifg_payload = load_tmp_corrected_chunk(output_path, category, chunk_id, "ifgs")
+            coh_payload = load_tmp_corrected_chunk(output_path, category, chunk_id, "coh")
+
+            if ifg_payload is None or coh_payload is None:
+                continue
+
+            if t >= len(ifg_payload["data"]) or t >= len(coh_payload["data"]):
+                continue
+
+            r0, r1 = ifg_payload["row_range"]
+            c0, c1 = ifg_payload["col_range"]
+
+            arr_ifg = ifg_payload["data"][t]
+            arr_coh = coh_payload["data"][t]
+
+            if arr_ifg is not None:
+                full_ifg[r0:r1, c0:c1] = arr_ifg
+                has_ifg = True
+
+            if arr_coh is not None:
+                full_coh[r0:r1, c0:c1] = arr_coh
+                has_coh = True
+
+        if not has_ifg:
+            del full_ifg, full_coh
+            gc.collect()
+            continue
+
+        ifg_name = ifg_names_for_category[t]
+
+        output_phase_path = os.path.join(output_wrap_dir, ifg_name)
+        os.makedirs(output_phase_path, exist_ok=True)
+
+        output_phase_file = os.path.join(
+            output_phase_path, ifg_name + ".geo.diff_pha.tif"
+        )
+        output_cc_file = os.path.join(
+            output_phase_path, ifg_name + ".geo.cc.tif"
+        )
+
+        ifg_cc_2tif(full_ifg, output_phase_file, template_tif_path)
+        if has_coh:
+            ifg_cc_2tif(full_coh, output_cc_file, template_tif_path)
+
+        written += 1
+
+        del full_ifg, full_coh
+        gc.collect()
+
+    return {
+        "category": category,
+        "status": "ok",
+        "written": written,
+        "n_times": n_times,
+    }
+
+
+# ======================================================================================
+# Main
+# ======================================================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_workers", type=int, default=48, help="Number of parallel workers across chunks.")
+    parser.add_argument("--n_write_workers", type=int, default=48, help="Number of parallel workers for final GEOC writing by category.")
+    parser.add_argument("--max_con", type=int, default=4, help="Maximum connection length in multiples of interval.")
+    parser.add_argument("--uncor_only", type=int, default=0, help="If 1, skip correction and just copy original IFGs.")
+    parser.add_argument("--keep_tmp_chunks", type=int, default=0, help="If 1, keep temporary corrected chunk files.")
+    args = parser.parse_args()
+
+    params = read_config()
+
+    root_path = params["root_path"]
+    output_path = params["output_path"]
+    frame = params["frame"]
+    start = params["start"]
+    end = params["end"]
+    interval = params["interval"]
+    nlook = params["nlook"]
+    LiCSAR_data = params["LiCSAR_data"]
+    an_mode = params["estimate_an_mode"]
+
+    start_date = datetime.strptime(start, "%Y%m%d")
+    end_date = datetime.strptime(end, "%Y%m%d")
+
+    desired_lengths = [interval * i for i in range(1, args.max_con + 1)]
+
+    print(f"estimate_an_mode = {an_mode}")
+    print(f"desired_lengths = {desired_lengths}")
+    print(f"n_workers = {args.n_workers}")
+    print(f"n_write_workers = {args.n_write_workers}")
+    print(f"uncor_only = {args.uncor_only}")
+
+    root_directory = get_root_directory(root_path, frame, LiCSAR_data)
+
+    chunk_index = load_chunk_index(output_path)
+    valid_chunks = chunk_index["valid_chunks"]
+    frame_shape = tuple(chunk_index["frame_shape"])
+
+    print(f"Number of valid chunks to process: {len(valid_chunks)}")
+
+    args_dict = {
+        "max_con": args.max_con,
+        "uncor_only": args.uncor_only,
+        "desired_lengths": desired_lengths,
+    }
+
+    results = []
+
+    # ------------------------------------------------------------------
+    # Stage 1: correct chunkwise
+    # ------------------------------------------------------------------
+    if args.n_workers == 1:
+        for chunk_id in valid_chunks:
+            cr, cc = chunk_id
+            print(f"Processing chunk r{cr:03d}, c{cc:03d} ...")
+            res = process_one_chunk(chunk_id, params, args_dict)
+            results.append(res)
+    else:
+        with ProcessPoolExecutor(max_workers=args.n_workers) as ex:
+            futures = {
+                ex.submit(process_one_chunk, chunk_id, params, args_dict): chunk_id
+                for chunk_id in valid_chunks
+            }
+
+            completed = 0
+            total = len(futures)
+
+            for fut in as_completed(futures):
+                completed += 1
+                chunk_id = futures[fut]
+                cr, cc = chunk_id
+
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {
+                        "chunk_id": chunk_id,
+                        "status": "failed",
+                        "reason": str(e),
+                    }
+
+                results.append(res)
+
+                pct = 100.0 * completed / total
+                print(
+                    f"[Correction {completed}/{total}] {pct:5.1f}% - chunk r{cr:03d}, c{cc:03d}: {res['status']}"
+                )
+
+    ok_results = [r for r in results if r["status"] == "ok"]
+    failed_results = [r for r in results if r["status"] != "ok"]
+
+    # ------------------------------------------------------------------
+    # Stage 2: prepare GEOC writing
+    # ------------------------------------------------------------------
+    GEOC_dir = "GEOC"
+    metadata_dir = "metadata"
+
+    output_wrap_dir = os.path.join(output_path, GEOC_dir)
+    os.makedirs(output_wrap_dir, exist_ok=True)
+
+    template_tif_path = os.path.join(root_directory, metadata_dir, frame + ".geo.hgt.tif")
+    if nlook != 1:
+        resampled_tif_path = os.path.join(output_wrap_dir, frame + ".geo.hgt.tif")
+        resample_geotiff(template_tif_path, resampled_tif_path, nlook)
+        template_tif_path = resampled_tif_path
+
+    all_ifgs_string = generate_ifg_pairs(start_date, end_date, interval, desired_lengths)
+
+    print("\nPreparing GEOC writing by category...")
+
+    category_epoch_counts = {}
+    for category in desired_lengths:
+        category_epoch_counts[category] = get_n_times_for_category(output_path, category, valid_chunks)
+
+    ifg_names_by_category = {}
+    flat_index = 0
+    for category in desired_lengths:
+        ncat = category_epoch_counts[category]
+        ifg_names_by_category[category] = all_ifgs_string[flat_index:flat_index + ncat]
+        flat_index += ncat
+
+    # ------------------------------------------------------------------
+    # Stage 3: GEOC writing by category, optionally parallel
+    # ------------------------------------------------------------------
+    print("Writing GEOC outputs by category...")
+
+    write_results = []
+
+    if args.n_write_workers == 1:
+        for k, category in enumerate(desired_lengths, start=1):
+            print(f"Writing category {category} days ({k}/{len(desired_lengths)}) ...")
+            res = write_one_category_to_geoc(
+                category=category,
+                output_path=output_path,
+                valid_chunks=valid_chunks,
+                frame_shape=frame_shape,
+                ifg_names_for_category=ifg_names_by_category.get(category, []),
+                output_wrap_dir=output_wrap_dir,
+                template_tif_path=template_tif_path,
+            )
+            write_results.append(res)
+            print(
+                f"  category {category}: {res['status']}, wrote {res['written']} of {res['n_times']}"
+            )
+    else:
+        with ProcessPoolExecutor(max_workers=args.n_write_workers) as ex:
+            futures = {
+                ex.submit(
+                    write_one_category_to_geoc,
+                    category,
+                    output_path,
+                    valid_chunks,
+                    frame_shape,
+                    ifg_names_by_category.get(category, []),
+                    output_wrap_dir,
+                    template_tif_path,
+                ): category
+                for category in desired_lengths
+            }
+
+            completed = 0
+            total = len(futures)
+
+            for fut in as_completed(futures):
+                completed += 1
+                category = futures[fut]
+
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {
+                        "category": category,
+                        "status": "failed",
+                        "written": 0,
+                        "n_times": 0,
+                        "reason": str(e),
+                    }
+
+                write_results.append(res)
+
+                pct = 100.0 * completed / total
+                msg = (
+                    f"[Writing {completed}/{total}] {pct:5.1f}% - "
+                    f"category {category}: {res['status']}, wrote {res.get('written', 0)}"
+                )
+                if "reason" in res:
+                    msg += f" ({res['reason']})"
+                print(msg)
+
+    print("\nAll corrected interferograms have been written to disk.")
+
+    # ------------------------------------------------------------------
+    # Stage 4: save summary
+    # ------------------------------------------------------------------
+    correction_dir = os.path.join(output_path, "Data", "corrected_chunks")
+    os.makedirs(correction_dir, exist_ok=True)
+
+    summary_counts = {cat: 0 for cat in desired_lengths}
+    for r in ok_results:
+        for cat, cnt in r.get("corrected_counts", {}).items():
+            summary_counts[cat] += cnt
+
+    written_total = sum(r.get("written", 0) for r in write_results if r.get("status") == "ok")
+
+    correction_chunk_index = {
+        "estimate_an_mode": an_mode,
+        "n_workers": args.n_workers,
+        "n_write_workers": args.n_write_workers,
+        "max_con": args.max_con,
+        "desired_lengths": desired_lengths,
+        "uncor_only": args.uncor_only,
+        "start": start,
+        "end": end,
+        "interval": interval,
+        "n_total_chunks": len(valid_chunks),
+        "n_ok_chunks": len(ok_results),
+        "n_failed_chunks": len(failed_results),
+        "results": results,
+        "write_results": write_results,
+        "summary_counts": summary_counts,
+        "written_total": written_total,
+        "output_geoc_dir": output_wrap_dir,
+    }
+
+    correction_chunk_index_file = os.path.join(correction_dir, "correction_chunk_index.pkl")
+    save_pickle(correction_chunk_index_file, correction_chunk_index)
+
+    # ------------------------------------------------------------------
+    # Stage 5: optionally clean temporary chunk files
+    # ------------------------------------------------------------------
+    if args.keep_tmp_chunks == 0:
+        tmp_dir = os.path.join(output_path, "Data", "corrected_tmp")
+        if os.path.exists(tmp_dir):
+            for root, dirs, files in os.walk(tmp_dir, topdown=False):
+                for name in files:
+                    try:
+                        os.remove(os.path.join(root, name))
+                    except OSError:
+                        pass
+                for name in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, name))
+                    except OSError:
+                        pass
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+
+    print("\nChunked correction completed.")
+    print(f"Successful chunks: {len(ok_results)}")
+    print(f"Failed/skipped chunks: {len(failed_results)}")
+    print(f"Total GEOC files written: {written_total}")
+    print(f"Saved correction summary to: {correction_chunk_index_file}")
+    print(f"Final GEOC output directory: {output_wrap_dir}")
+
+
+if __name__ == "__main__":
+    main()
